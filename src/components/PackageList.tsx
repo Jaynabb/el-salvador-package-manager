@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
 import type { Package, PackageStatus } from '../types';
-import { updatePackage } from '../services/firestoreClient';
+import { updatePackage, getPackageById } from '../services/firestoreClient';
 import { formatCurrency } from '../utils/dutyCalculator';
 import { sendPackageNotification } from '../services/smsService';
 import { addActivityLog } from '../services/firestoreClient';
+import { syncPackageToGoogleSheets } from '../services/googleSheetsService';
 
 interface Props {
   packages: Package[];
@@ -72,9 +73,12 @@ const PackageList: React.FC<Props> = ({ packages, onPackageUpdated }) => {
         action: `Status changed to ${getStatusText(newStatus)}`
       });
 
-      // Send SMS notification
+      // Get updated package and sync
       const pkg = packages.find(p => p.id === packageId);
       if (pkg) {
+        const updatedPkg = { ...pkg, ...updates } as Package;
+
+        // Send SMS notification
         const notificationTypes: Record<PackageStatus, any> = {
           'customs-cleared': 'customs_cleared',
           'ready-pickup': 'ready_for_pickup',
@@ -86,8 +90,11 @@ const PackageList: React.FC<Props> = ({ packages, onPackageUpdated }) => {
 
         const notificationType = notificationTypes[newStatus];
         if (notificationType) {
-          await sendPackageNotification({ ...pkg, ...updates } as Package, notificationType);
+          await sendPackageNotification(updatedPkg, notificationType);
         }
+
+        // Sync to Google Sheets
+        await syncPackageToGoogleSheets(updatedPkg);
       }
 
       onPackageUpdated();

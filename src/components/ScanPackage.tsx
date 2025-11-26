@@ -5,6 +5,7 @@ import { addPackage, findCustomerByPhone, addCustomer } from '../services/firest
 import { calculateDuty, formatCurrency } from '../utils/dutyCalculator';
 import { sendPackageNotification } from '../services/smsService';
 import { addActivityLog } from '../services/firestoreClient';
+import { syncPackageToGoogleSheets } from '../services/googleSheetsService';
 import type { PackageItem, PackageStatus } from '../types';
 
 interface Props {
@@ -172,10 +173,11 @@ const ScanPackage: React.FC<Props> = ({ onPackageAdded }) => {
       });
 
       // Send SMS notification
-      await sendPackageNotification(
-        { id: packageId, ...packageData, createdAt: new Date(), updatedAt: new Date() },
-        'package_received'
-      );
+      const fullPackage = { id: packageId, ...packageData, createdAt: new Date(), updatedAt: new Date() };
+      await sendPackageNotification(fullPackage, 'package_received');
+
+      // Sync to Google Sheets in real-time
+      await syncPackageToGoogleSheets(fullPackage);
 
       updatePackage(pkg.id, { saved: true });
       setSuccess(`Package ${pkg.trackingNumber} saved!`);

@@ -1,72 +1,220 @@
 import type { Package, Customer } from '../types';
 
 /**
- * Google Sheets integration service for CRM
- * This exports package and customer data to Google Sheets
- *
- * Note: For production use, you'll need to:
- * 1. Create a Google Cloud project
- * 2. Enable Google Sheets API
- * 3. Create API credentials
- * 4. Use Google Sheets API client library or REST API
- *
- * For now, this is a simplified implementation that formats data
- * for export. You can use the Google Sheets API or Apps Script to import.
+ * Live Google Sheets integration service
+ * Automatically syncs package data to Google Sheets in real-time
+ * Perfect for Make.com automation workflows
  */
 
-interface SheetRow {
-  [key: string]: string | number | boolean;
+interface GoogleSheetsRow {
+  // Package Info
+  packageId: string;
+  trackingNumber: string;
+  status: string;
+  receivedDate: string;
+  customsClearedDate: string;
+  deliveredDate: string;
+
+  // Customer Info
+  customerId: string;
+  customerName: string;
+  customerPhone: string;
+  customerEmail: string;
+
+  // Shipment Details
+  origin: string;
+  carrier: string;
+  totalWeight: number;
+
+  // Items
+  itemsCount: number;
+  itemsList: string;
+  itemsDetails: string;
+
+  // Financial
+  totalValue: number;
+  customsDuty: number;
+  vat: number;
+  totalFees: number;
+  paymentStatus: string;
+
+  // Customs Declaration
+  declaredValue: number;
+  declarationCurrency: string;
+  declarationPurpose: string;
+  certificateOfOrigin: string;
+  specialPermitsRequired: string;
+
+  // Additional
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
-export const formatPackageForSheets = (pkg: Package): SheetRow => {
+/**
+ * Format package data for Google Sheets
+ */
+export const formatPackageForSheets = (pkg: Package): GoogleSheetsRow => {
   return {
-    'Package ID': pkg.id,
-    'Tracking Number': pkg.trackingNumber,
-    'Customer Name': pkg.customerName,
-    'Customer Phone': pkg.customerPhone,
-    'Customer Email': pkg.customerEmail || '',
-    'Origin': pkg.origin,
-    'Carrier': pkg.carrier || '',
-    'Status': pkg.status,
-    'Received Date': pkg.receivedDate.toLocaleDateString(),
-    'Delivered Date': pkg.deliveredDate?.toLocaleDateString() || '',
-    'Total Value (USD)': pkg.totalValue,
-    'Total Weight (kg)': pkg.totalWeight || 0,
-    'Import Duty (USD)': pkg.customsDuty,
-    'VAT (USD)': pkg.vat,
-    'Total Fees (USD)': pkg.totalFees,
-    'Payment Status': pkg.paymentStatus,
-    'Items Count': pkg.items.length,
-    'Items': pkg.items.map(item => `${item.name} (${item.quantity})`).join(', '),
-    'Notes': pkg.notes || ''
-  };
-};
+    // Package Info
+    packageId: pkg.id,
+    trackingNumber: pkg.trackingNumber,
+    status: pkg.status,
+    receivedDate: pkg.receivedDate.toISOString(),
+    customsClearedDate: pkg.customsClearedDate?.toISOString() || '',
+    deliveredDate: pkg.deliveredDate?.toISOString() || '',
 
-export const formatCustomerForSheets = (customer: Customer): SheetRow => {
-  return {
-    'Customer ID': customer.id,
-    'Name': customer.name,
-    'Phone': customer.phone,
-    'Email': customer.email || '',
-    'Address': customer.address || '',
-    'Created Date': customer.createdAt.toLocaleDateString()
+    // Customer Info
+    customerId: pkg.customerId,
+    customerName: pkg.customerName,
+    customerPhone: pkg.customerPhone,
+    customerEmail: pkg.customerEmail || '',
+
+    // Shipment Details
+    origin: pkg.origin,
+    carrier: pkg.carrier || '',
+    totalWeight: pkg.totalWeight || 0,
+
+    // Items
+    itemsCount: pkg.items.length,
+    itemsList: pkg.items.map(item => `${item.name} (x${item.quantity})`).join(', '),
+    itemsDetails: JSON.stringify(pkg.items),
+
+    // Financial
+    totalValue: pkg.totalValue,
+    customsDuty: pkg.customsDuty,
+    vat: pkg.vat,
+    totalFees: pkg.totalFees,
+    paymentStatus: pkg.paymentStatus,
+
+    // Customs Declaration
+    declaredValue: pkg.customsDeclaration.declaredValue,
+    declarationCurrency: pkg.customsDeclaration.currency,
+    declarationPurpose: pkg.customsDeclaration.purpose,
+    certificateOfOrigin: pkg.customsDeclaration.certificateOfOrigin ? 'Yes' : 'No',
+    specialPermitsRequired: pkg.customsDeclaration.specialPermitsRequired ? 'Yes' : 'No',
+
+    // Additional
+    notes: pkg.notes || '',
+    createdAt: pkg.createdAt.toISOString(),
+    updatedAt: pkg.updatedAt.toISOString()
   };
 };
 
 /**
- * Generate CSV content for export
+ * Sync a single package to Google Sheets (real-time)
  */
-export const generateCSV = (data: SheetRow[]): string => {
-  if (data.length === 0) return '';
+export const syncPackageToGoogleSheets = async (pkg: Package): Promise<{ success: boolean; error?: string }> => {
+  const webhookUrl = import.meta.env.VITE_GOOGLE_SHEETS_WEBHOOK_URL;
 
-  const headers = Object.keys(data[0]);
+  if (!webhookUrl) {
+    console.warn('Google Sheets webhook URL not configured');
+    return { success: false, error: 'Webhook URL not configured' };
+  }
+
+  try {
+    const data = formatPackageForSheets(pkg);
+
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'addOrUpdatePackage',
+        data: data
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    console.log('✓ Synced to Google Sheets:', pkg.trackingNumber);
+
+    return { success: true };
+  } catch (error) {
+    console.error('Failed to sync to Google Sheets:', error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error'
+    };
+  }
+};
+
+/**
+ * Batch sync multiple packages
+ */
+export const syncMultiplePackagesToGoogleSheets = async (packages: Package[]): Promise<void> => {
+  const webhookUrl = import.meta.env.VITE_GOOGLE_SHEETS_WEBHOOK_URL;
+
+  if (!webhookUrl) {
+    console.warn('Google Sheets webhook URL not configured');
+    return;
+  }
+
+  try {
+    const data = packages.map(formatPackageForSheets);
+
+    await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'batchAddPackages',
+        data: data
+      })
+    });
+
+    console.log(`✓ Batch synced ${packages.length} packages to Google Sheets`);
+  } catch (error) {
+    console.error('Failed to batch sync to Google Sheets:', error);
+  }
+};
+
+/**
+ * Delete package from Google Sheets
+ */
+export const deletePackageFromGoogleSheets = async (packageId: string): Promise<void> => {
+  const webhookUrl = import.meta.env.VITE_GOOGLE_SHEETS_WEBHOOK_URL;
+
+  if (!webhookUrl) {
+    return;
+  }
+
+  try {
+    await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'deletePackage',
+        packageId: packageId
+      })
+    });
+
+    console.log('✓ Deleted from Google Sheets:', packageId);
+  } catch (error) {
+    console.error('Failed to delete from Google Sheets:', error);
+  }
+};
+
+/**
+ * Legacy CSV export (backup method)
+ */
+export const exportPackagesToCSV = (packages: Package[]) => {
+  const data = packages.map(formatPackageForSheets);
+
+  const headers = Object.keys(data[0] || {});
   const csvRows = [
     headers.join(','),
     ...data.map(row =>
       headers.map(header => {
-        const value = row[header];
+        const value = (row as any)[header];
         const stringValue = String(value);
-        // Escape quotes and wrap in quotes if contains comma
         return stringValue.includes(',') || stringValue.includes('"')
           ? `"${stringValue.replace(/"/g, '""')}"`
           : stringValue;
@@ -74,53 +222,16 @@ export const generateCSV = (data: SheetRow[]): string => {
     )
   ];
 
-  return csvRows.join('\n');
-};
-
-/**
- * Download CSV file
- */
-export const downloadCSV = (data: SheetRow[], filename: string) => {
-  const csv = generateCSV(data);
+  const csv = csvRows.join('\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const link = document.createElement('a');
   const url = URL.createObjectURL(blob);
 
   link.setAttribute('href', url);
-  link.setAttribute('download', filename);
+  link.setAttribute('download', `packages_export_${new Date().toISOString().split('T')[0]}.csv`);
   link.style.visibility = 'hidden';
 
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
-};
-
-/**
- * Export packages to CSV
- */
-export const exportPackagesToCSV = (packages: Package[]) => {
-  const data = packages.map(formatPackageForSheets);
-  const filename = `packages_export_${new Date().toISOString().split('T')[0]}.csv`;
-  downloadCSV(data, filename);
-};
-
-/**
- * Export customers to CSV
- */
-export const exportCustomersToCSV = (customers: Customer[]) => {
-  const data = customers.map(formatCustomerForSheets);
-  const filename = `customers_export_${new Date().toISOString().split('T')[0]}.csv`;
-  downloadCSV(data, filename);
-};
-
-/**
- * Future: Direct Google Sheets API integration
- * This would use the Google Sheets API to directly write to a spreadsheet
- */
-export const syncToGoogleSheets = async (packages: Package[]) => {
-  // TODO: Implement Google Sheets API integration
-  // For now, just export to CSV
-  console.log('Syncing to Google Sheets...', packages.length, 'packages');
-  // This would use the Google Sheets API client
-  // to append or update rows in a specific spreadsheet
 };
