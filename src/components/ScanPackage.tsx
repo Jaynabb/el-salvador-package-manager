@@ -2,7 +2,7 @@ import React, { useState, useRef } from 'react';
 import { convertPdfToImages } from '../utils/pdfHelper';
 import { analyzePackagePhoto } from '../services/geminiService';
 import { addPackage, findCustomerByPhone, addCustomer } from '../services/firestoreClient';
-import { calculateDuty } from '../utils/dutyCalculator';
+import { calculateDuty, formatCurrency } from '../utils/dutyCalculator';
 import { sendPackageNotification } from '../services/smsService';
 import { addActivityLog } from '../services/firestoreClient';
 import type { PackageItem, PackageStatus } from '../types';
@@ -11,77 +11,108 @@ interface Props {
   onPackageAdded: () => void;
 }
 
+interface ScannedPackage {
+  id: string;
+  imagePreview: string;
+  trackingNumber: string;
+  carrier: string;
+  origin: string;
+  customerName: string;
+  customerPhone: string;
+  customerEmail: string;
+  items: PackageItem[];
+  status: PackageStatus;
+  notes: string;
+  totalValue: number;
+  totalFees: number;
+  saved: boolean;
+}
+
 const ScanPackage: React.FC<Props> = ({ onPackageAdded }) => {
-  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [scannedPackages, setScannedPackages] = useState<ScannedPackage[]>([]);
   const [analyzing, setAnalyzing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState(false);
+  const [success, setSuccess] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Extracted data
-  const [trackingNumber, setTrackingNumber] = useState('');
-  const [carrier, setCarrier] = useState('');
-  const [origin, setOrigin] = useState('');
-  const [customerName, setCustomerName] = useState('');
-  const [customerPhone, setCustomerPhone] = useState('');
-  const [customerEmail, setCustomerEmail] = useState('');
-  const [items, setItems] = useState<PackageItem[]>([]);
-  const [status, setStatus] = useState<PackageStatus>('received');
-  const [notes, setNotes] = useState('');
-
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
 
     setError(null);
-    setSuccess(false);
+    setSuccess(null);
+    setAnalyzing(true);
 
     try {
-      let dataUrl: string;
+      const newPackages: ScannedPackage[] = [];
 
-      if (file.type === 'application/pdf') {
-        const images = await convertPdfToImages(file);
-        dataUrl = images[0];
-      } else {
-        dataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result as string);
-          reader.onerror = reject;
-          reader.readAsDataURL(file);
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        let dataUrl: string;
+
+        if (file.type === 'application/pdf') {
+          const images = await convertPdfToImages(file);
+          dataUrl = images[0];
+        } else {
+          dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+          });
+        }
+
+        // Analyze with AI
+        const base64Image = dataUrl.split(',')[1];
+        const result = await analyzePackagePhoto(base64Image);
+
+        const items = result.items;
+        const dutyCalc = calculateDuty(items, 'personal');
+
+        newPackages.push({
+          id: `pkg_${Date.now()}_${i}`,
+          imagePreview: dataUrl,
+          trackingNumber: result.trackingNumber || `TRACK${Date.now()}${i}`,
+          carrier: result.carrier || '',
+          origin: result.origin || '',
+          customerName: '',
+          customerPhone: '',
+          customerEmail: '',
+          items,
+          status: 'received',
+          notes: '',
+          totalValue: dutyCalc.declaredValue,
+          totalFees: dutyCalc.totalFees,
+          saved: false
         });
       }
 
-      setImagePreview(dataUrl);
+      setScannedPackages([...scannedPackages, ...newPackages]);
+      setSuccess(`Scanned ${newPackages.length} package${newPackages.length > 1 ? 's' : ''}!`);
     } catch (err: any) {
-      setError(err.message || 'Failed to load file');
-    }
-  };
-
-  const handleAnalyze = async () => {
-    if (!imagePreview) return;
-
-    setAnalyzing(true);
-    setError(null);
-
-    try {
-      const base64Image = imagePreview.split(',')[1];
-      const result = await analyzePackagePhoto(base64Image);
-
-      setTrackingNumber(result.trackingNumber || '');
-      setCarrier(result.carrier || '');
-      setOrigin(result.origin || '');
-      setItems(result.items);
-    } catch (err: any) {
-      setError(err.message || 'Failed to analyze image');
+      setError(err.message || 'Failed to scan packages');
     } finally {
       setAnalyzing(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
     }
   };
 
-  const handleSavePackage = async () => {
-    if (!trackingNumber || !customerName || !customerPhone || items.length === 0) {
-      setError('Please fill in tracking number, customer info, and at least one item');
+  const updatePackage = (id: string, updates: Partial<ScannedPackage>) => {
+    setScannedPackages(scannedPackages.map(pkg =>
+      pkg.id === id ? { ...pkg, ...updates } : pkg
+    ));
+  };
+
+  const removePackage = (id: string) => {
+    setScannedPackages(scannedPackages.filter(pkg => pkg.id !== id));
+  };
+
+  const handleSavePackage = async (pkg: ScannedPackage) => {
+    if (!pkg.trackingNumber || !pkg.customerName || !pkg.customerPhone || pkg.items.length === 0) {
+      setError(`Package ${pkg.trackingNumber}: Please fill in tracking number, customer info, and items`);
       return;
     }
 
@@ -90,31 +121,31 @@ const ScanPackage: React.FC<Props> = ({ onPackageAdded }) => {
 
     try {
       // Find or create customer
-      let customer = await findCustomerByPhone(customerPhone);
+      let customer = await findCustomerByPhone(pkg.customerPhone);
       if (!customer) {
         const customerId = await addCustomer({
-          name: customerName,
-          phone: customerPhone,
-          email: customerEmail || undefined,
+          name: pkg.customerName,
+          phone: pkg.customerPhone,
+          email: pkg.customerEmail || undefined,
         });
-        customer = { id: customerId, name: customerName, phone: customerPhone, email: customerEmail, createdAt: new Date() };
+        customer = { id: customerId, name: pkg.customerName, phone: pkg.customerPhone, email: pkg.customerEmail, createdAt: new Date() };
       }
 
       // Calculate duties
-      const dutyCalc = calculateDuty(items, 'personal');
+      const dutyCalc = calculateDuty(pkg.items, 'personal');
 
       // Create package
       const packageData = {
-        trackingNumber,
+        trackingNumber: pkg.trackingNumber,
         customerId: customer.id,
         customerName: customer.name,
         customerPhone: customer.phone,
         customerEmail: customer.email,
-        items,
+        items: pkg.items,
         totalValue: dutyCalc.declaredValue,
-        totalWeight: items.reduce((sum, item) => sum + (item.weight || 0), 0),
-        origin,
-        carrier,
+        totalWeight: pkg.items.reduce((sum, item) => sum + (item.weight || 0), 0),
+        origin: pkg.origin,
+        carrier: pkg.carrier,
         customsDeclaration: {
           declaredValue: dutyCalc.declaredValue,
           currency: 'USD',
@@ -122,13 +153,13 @@ const ScanPackage: React.FC<Props> = ({ onPackageAdded }) => {
           estimatedDuty: dutyCalc.importDuty,
           estimatedVAT: dutyCalc.vat
         },
-        status,
+        status: pkg.status,
         receivedDate: new Date(),
         customsDuty: dutyCalc.importDuty,
         vat: dutyCalc.vat,
         totalFees: dutyCalc.totalFees,
         paymentStatus: 'pending' as const,
-        notes
+        notes: pkg.notes
       };
 
       const packageId = await addPackage(packageData);
@@ -137,7 +168,7 @@ const ScanPackage: React.FC<Props> = ({ onPackageAdded }) => {
       await addActivityLog({
         packageId,
         action: 'Package received',
-        details: { trackingNumber, customerName }
+        details: { trackingNumber: pkg.trackingNumber, customerName: pkg.customerName }
       });
 
       // Send SMS notification
@@ -146,11 +177,11 @@ const ScanPackage: React.FC<Props> = ({ onPackageAdded }) => {
         'package_received'
       );
 
-      setSuccess(true);
-      handleNewScan();
+      updatePackage(pkg.id, { saved: true });
+      setSuccess(`Package ${pkg.trackingNumber} saved!`);
       onPackageAdded();
 
-      setTimeout(() => setSuccess(false), 3000);
+      setTimeout(() => setSuccess(null), 3000);
     } catch (err: any) {
       setError(err.message || 'Failed to save package');
     } finally {
@@ -158,269 +189,261 @@ const ScanPackage: React.FC<Props> = ({ onPackageAdded }) => {
     }
   };
 
-  const handleNewScan = () => {
-    setImagePreview(null);
-    setTrackingNumber('');
-    setCarrier('');
-    setOrigin('');
-    setCustomerName('');
-    setCustomerPhone('');
-    setCustomerEmail('');
-    setItems([]);
-    setNotes('');
-    setError(null);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
+  const handleSaveAll = async () => {
+    const unsavedPackages = scannedPackages.filter(pkg => !pkg.saved);
+
+    for (const pkg of unsavedPackages) {
+      await handleSavePackage(pkg);
     }
   };
 
+  const handleClearSaved = () => {
+    setScannedPackages(scannedPackages.filter(pkg => !pkg.saved));
+    setSuccess('Cleared saved packages!');
+    setTimeout(() => setSuccess(null), 2000);
+  };
+
   return (
-    <div className="max-w-4xl mx-auto">
+    <div className="max-w-7xl mx-auto">
       <div className="bg-slate-800/50 rounded-2xl p-8 border border-slate-700">
-        <h2 className="text-3xl font-bold text-white mb-2">Scan Package</h2>
-        <p className="text-slate-400 mb-6">
-          Take a photo of the shipping label or invoice to automatically extract package information.
-        </p>
-
-        {/* Upload Section */}
-        {!imagePreview && (
-          <div className="border-2 border-dashed border-slate-600 rounded-xl p-12 text-center hover:border-blue-500 transition-colors">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*,application/pdf"
-              capture="environment"
-              onChange={handleFileSelect}
-              className="hidden"
-              id="package-upload"
-            />
-            <label htmlFor="package-upload" className="cursor-pointer">
-              <div className="text-6xl mb-4">📸</div>
-              <div className="text-white font-medium mb-2">Take Photo or Upload File</div>
-              <div className="text-slate-400 text-sm">Supports images (JPG, PNG) and PDF files</div>
-            </label>
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h2 className="text-3xl font-bold text-white">Scan Packages</h2>
+            <p className="text-slate-400 mt-1">
+              Scan multiple shipping labels at once - AI will extract all package details
+            </p>
           </div>
-        )}
-
-        {/* Image Preview & Analysis */}
-        {imagePreview && !analyzing && items.length === 0 && (
-          <div className="space-y-4">
-            <img
-              src={imagePreview}
-              alt="Package preview"
-              className="w-full rounded-lg border-2 border-slate-700"
-            />
-            <div className="flex gap-4">
+          {scannedPackages.length > 0 && (
+            <div className="flex gap-3">
               <button
-                onClick={handleAnalyze}
-                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 px-6 rounded-lg transition-colors"
+                onClick={handleClearSaved}
+                className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors"
               >
-                🔍 Analyze with AI
+                Clear Saved
               </button>
               <button
-                onClick={handleNewScan}
-                className="bg-slate-700 hover:bg-slate-600 text-white font-medium py-3 px-6 rounded-lg transition-colors"
+                onClick={handleSaveAll}
+                disabled={saving || scannedPackages.every(p => p.saved)}
+                className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-slate-600 text-white rounded-lg transition-colors"
               >
-                Cancel
+                💾 Save All ({scannedPackages.filter(p => !p.saved).length})
               </button>
             </div>
-          </div>
-        )}
+          )}
+        </div>
+
+        {/* Upload Section */}
+        <div className="border-2 border-dashed border-slate-600 rounded-xl p-8 text-center hover:border-blue-500 transition-colors mb-6">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*,application/pdf"
+            capture="environment"
+            onChange={handleFileSelect}
+            className="hidden"
+            id="package-upload"
+            multiple
+          />
+          <label htmlFor="package-upload" className="cursor-pointer">
+            <div className="text-6xl mb-4">📸</div>
+            <div className="text-white font-medium mb-2">
+              {analyzing ? 'Analyzing packages...' : 'Take Photos or Upload Multiple Files'}
+            </div>
+            <div className="text-slate-400 text-sm">
+              Select multiple images or PDFs at once for batch scanning
+            </div>
+          </label>
+        </div>
 
         {/* Analyzing State */}
         {analyzing && (
-          <div className="text-center py-12">
+          <div className="text-center py-8 mb-6">
             <div className="text-6xl mb-4 animate-pulse">🔍</div>
-            <div className="text-white text-xl font-medium mb-2">Analyzing Package...</div>
-            <div className="text-slate-400">Extracting tracking number, items, and customs info</div>
+            <div className="text-white text-xl font-medium mb-2">Analyzing Packages...</div>
+            <div className="text-slate-400">Extracting data with AI - this may take a moment</div>
           </div>
         )}
 
-        {/* Package Form */}
-        {items.length > 0 && (
-          <div className="space-y-6">
-            <div className="bg-green-500/10 border border-green-500/50 rounded-lg p-4">
-              <div className="text-green-400 font-medium">
-                ✓ Analysis complete! Review and edit details below
-              </div>
-            </div>
-
-            {/* Package Details */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">
-                  Tracking Number *
-                </label>
-                <input
-                  type="text"
-                  value={trackingNumber}
-                  onChange={(e) => setTrackingNumber(e.target.value)}
-                  className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-                  placeholder="ABC123456789"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">
-                  Carrier
-                </label>
-                <input
-                  type="text"
-                  value={carrier}
-                  onChange={(e) => setCarrier(e.target.value)}
-                  className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-                  placeholder="DHL, FedEx, USPS, etc."
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">
-                  Origin Country
-                </label>
-                <input
-                  type="text"
-                  value={origin}
-                  onChange={(e) => setOrigin(e.target.value)}
-                  className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-                  placeholder="United States, China, etc."
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">
-                  Status
-                </label>
-                <select
-                  value={status}
-                  onChange={(e) => setStatus(e.target.value as PackageStatus)}
-                  className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-                >
-                  <option value="received">Received</option>
-                  <option value="customs-pending">Customs Pending</option>
-                  <option value="customs-cleared">Customs Cleared</option>
-                  <option value="ready-pickup">Ready for Pickup</option>
-                  <option value="on-hold">On Hold</option>
-                </select>
-              </div>
-            </div>
-
-            {/* Customer Info */}
-            <div className="border-t border-slate-700 pt-6">
-              <h3 className="text-lg font-semibold text-white mb-4">Customer Information</h3>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-slate-300 mb-2">
-                    Name *
-                  </label>
-                  <input
-                    type="text"
-                    value={customerName}
-                    onChange={(e) => setCustomerName(e.target.value)}
-                    className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-                    placeholder="John Doe"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-slate-300 mb-2">
-                    Phone *
-                  </label>
-                  <input
-                    type="tel"
-                    value={customerPhone}
-                    onChange={(e) => setCustomerPhone(e.target.value)}
-                    className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-                    placeholder="+503 1234-5678"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-slate-300 mb-2">
-                    Email
-                  </label>
-                  <input
-                    type="email"
-                    value={customerEmail}
-                    onChange={(e) => setCustomerEmail(e.target.value)}
-                    className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-                    placeholder="customer@email.com"
-                  />
-                </div>
-              </div>
-            </div>
-
-            {/* Items */}
-            <div className="border-t border-slate-700 pt-6">
-              <h3 className="text-lg font-semibold text-white mb-4">
-                Package Items ({items.length})
+        {/* Scanned Packages List */}
+        {scannedPackages.length > 0 && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-xl font-semibold text-white">
+                Scanned Packages ({scannedPackages.length}) -
+                <span className="text-green-400 ml-2">{scannedPackages.filter(p => p.saved).length} Saved</span>
               </h3>
-              <div className="space-y-2 max-h-64 overflow-y-auto">
-                {items.map((item, index) => (
-                  <div
-                    key={index}
-                    className="bg-slate-700/50 rounded-lg p-4 border border-slate-600"
-                  >
-                    <div className="font-medium text-white">{item.name}</div>
-                    {item.description && (
-                      <div className="text-sm text-slate-400 mt-1">{item.description}</div>
+            </div>
+
+            {scannedPackages.map((pkg) => (
+              <div
+                key={pkg.id}
+                className={`bg-slate-700/30 rounded-lg p-6 border transition-all ${
+                  pkg.saved
+                    ? 'border-green-500/50 bg-green-500/5'
+                    : 'border-slate-600 hover:border-slate-500'
+                }`}
+              >
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  {/* Image Preview */}
+                  <div>
+                    <img
+                      src={pkg.imagePreview}
+                      alt={`Package ${pkg.trackingNumber}`}
+                      className="w-full rounded-lg border border-slate-600"
+                    />
+                    {pkg.saved && (
+                      <div className="mt-2 bg-green-500/20 border border-green-500/50 rounded px-3 py-2 text-center">
+                        <span className="text-green-400 font-medium text-sm">✓ Saved</span>
+                      </div>
                     )}
-                    <div className="flex gap-4 mt-2 text-sm">
-                      <span className="text-blue-400">Qty: {item.quantity}</span>
-                      <span className="text-green-400">${item.unitValue} each</span>
-                      <span className="text-yellow-400">Total: ${item.totalValue}</span>
-                      {item.hsCode && (
-                        <span className="text-purple-400">HS: {item.hsCode}</span>
+                  </div>
+
+                  {/* Package Details */}
+                  <div className="lg:col-span-2 space-y-4">
+                    {/* Header */}
+                    <div className="flex items-start justify-between">
+                      <div>
+                        <div className="flex items-center gap-3">
+                          <h4 className="text-lg font-semibold text-white">
+                            {pkg.trackingNumber}
+                          </h4>
+                          <span className="px-2 py-1 bg-blue-500/20 text-blue-400 text-xs rounded border border-blue-500/50">
+                            {pkg.items.length} items
+                          </span>
+                        </div>
+                        <div className="flex gap-4 mt-2 text-sm text-slate-400">
+                          <span>💰 {formatCurrency(pkg.totalValue)}</span>
+                          <span>📊 Fees: {formatCurrency(pkg.totalFees)}</span>
+                        </div>
+                      </div>
+                      {!pkg.saved && (
+                        <button
+                          onClick={() => removePackage(pkg.id)}
+                          className="text-red-400 hover:text-red-300 transition-colors"
+                          title="Remove"
+                        >
+                          ✕
+                        </button>
                       )}
                     </div>
+
+                    {/* Form Fields */}
+                    {!pkg.saved && (
+                      <>
+                        <div className="grid grid-cols-2 gap-3">
+                          <input
+                            type="text"
+                            value={pkg.trackingNumber}
+                            onChange={(e) => updatePackage(pkg.id, { trackingNumber: e.target.value })}
+                            placeholder="Tracking Number *"
+                            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+                          />
+                          <input
+                            type="text"
+                            value={pkg.carrier}
+                            onChange={(e) => updatePackage(pkg.id, { carrier: e.target.value })}
+                            placeholder="Carrier"
+                            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+                          />
+                          <input
+                            type="text"
+                            value={pkg.origin}
+                            onChange={(e) => updatePackage(pkg.id, { origin: e.target.value })}
+                            placeholder="Origin Country"
+                            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+                          />
+                          <select
+                            value={pkg.status}
+                            onChange={(e) => updatePackage(pkg.id, { status: e.target.value as PackageStatus })}
+                            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+                          >
+                            <option value="received">Received</option>
+                            <option value="customs-pending">Customs Pending</option>
+                            <option value="customs-cleared">Customs Cleared</option>
+                            <option value="ready-pickup">Ready for Pickup</option>
+                            <option value="on-hold">On Hold</option>
+                          </select>
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-3">
+                          <input
+                            type="text"
+                            value={pkg.customerName}
+                            onChange={(e) => updatePackage(pkg.id, { customerName: e.target.value })}
+                            placeholder="Customer Name *"
+                            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+                          />
+                          <input
+                            type="tel"
+                            value={pkg.customerPhone}
+                            onChange={(e) => updatePackage(pkg.id, { customerPhone: e.target.value })}
+                            placeholder="Phone *"
+                            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+                          />
+                          <input
+                            type="email"
+                            value={pkg.customerEmail}
+                            onChange={(e) => updatePackage(pkg.id, { customerEmail: e.target.value })}
+                            placeholder="Email"
+                            className="px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+                          />
+                        </div>
+
+                        <textarea
+                          value={pkg.notes}
+                          onChange={(e) => updatePackage(pkg.id, { notes: e.target.value })}
+                          placeholder="Notes..."
+                          className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm"
+                          rows={2}
+                        />
+                      </>
+                    )}
+
+                    {/* Items */}
+                    <div>
+                      <h5 className="text-sm font-medium text-slate-300 mb-2">Package Items:</h5>
+                      <div className="space-y-1 max-h-32 overflow-y-auto">
+                        {pkg.items.map((item, idx) => (
+                          <div key={idx} className="bg-slate-800/50 rounded px-3 py-2 text-sm">
+                            <div className="flex justify-between">
+                              <span className="text-white">{item.name}</span>
+                              <div className="flex gap-3 text-xs">
+                                <span className="text-blue-400">Qty: {item.quantity}</span>
+                                <span className="text-green-400">${item.totalValue}</span>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Actions */}
+                    {!pkg.saved && (
+                      <button
+                        onClick={() => handleSavePackage(pkg)}
+                        disabled={saving}
+                        className="w-full bg-green-600 hover:bg-green-700 disabled:bg-slate-600 text-white font-medium py-2 px-4 rounded-lg transition-colors"
+                      >
+                        {saving ? '💾 Saving...' : '💾 Save & Notify Customer'}
+                      </button>
+                    )}
                   </div>
-                ))}
+                </div>
               </div>
-            </div>
-
-            {/* Notes */}
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">
-                Notes
-              </label>
-              <textarea
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                className="w-full px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white"
-                rows={3}
-                placeholder="Any additional notes..."
-              />
-            </div>
-
-            {/* Actions */}
-            <div className="flex gap-4">
-              <button
-                onClick={handleSavePackage}
-                disabled={saving}
-                className="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-slate-600 text-white font-medium py-3 px-6 rounded-lg transition-colors"
-              >
-                {saving ? '💾 Saving...' : '💾 Save Package & Notify Customer'}
-              </button>
-              <button
-                onClick={handleNewScan}
-                className="bg-slate-700 hover:bg-slate-600 text-white font-medium py-3 px-6 rounded-lg transition-colors"
-              >
-                New Scan
-              </button>
-            </div>
+            ))}
           </div>
         )}
 
-        {/* Error Message */}
+        {/* Messages */}
         {error && (
           <div className="mt-4 bg-red-500/10 border border-red-500/50 rounded-lg p-4">
             <div className="text-red-400">⚠️ {error}</div>
           </div>
         )}
 
-        {/* Success Message */}
         {success && (
           <div className="mt-4 bg-green-500/10 border border-green-500/50 rounded-lg p-4">
-            <div className="text-green-400">✓ Package saved and customer notified!</div>
+            <div className="text-green-400">✓ {success}</div>
           </div>
         )}
       </div>
