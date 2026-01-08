@@ -25,3 +25,18 @@ dist-ssr
 # Environment variables - DO NOT COMMIT
 .env
 functions/.env
+
+# Scripts with hardcoded secrets
+update-user-status.js
+update-user-status.mjs
+*-admin*.js
+setup-admin.js
+create-admin*.js
+fix-*.js
+check-*.mjs
+migrate-*.js
+
+# Documentation with example secrets
+GOOGLE_DRIVE_SETUP.md
+*_SETUP.md
+
