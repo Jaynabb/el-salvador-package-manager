@@ -20,6 +20,12 @@ export default function Settings() {
     role: 'organization-member' as 'organization-owner' | 'organization-member'
   });
 
+  // WhatsApp Integration state
+  const [whatsappPhone, setWhatsappPhone] = useState('');
+  const [whatsappCountryCode, setWhatsappCountryCode] = useState('+1');
+  const [whatsappSaving, setWhatsappSaving] = useState(false);
+  const [whatsappMessage, setWhatsappMessage] = useState<{type: 'success' | 'error', text: string} | null>(null);
+
   // Load organization data and members
   useEffect(() => {
     const loadOrganization = async () => {
@@ -58,6 +64,24 @@ export default function Settings() {
             ...doc.data()
           })) as User[];
           setMembers(membersData);
+        }
+
+        // Load WhatsApp phone number
+        if (currentUser.uid) {
+          const userRef = doc(db, 'users', currentUser.uid);
+          const userDoc = await getDoc(userRef);
+          if (userDoc.exists()) {
+            const whatsappPhoneData = userDoc.data().whatsappPhone;
+            if (whatsappPhoneData) {
+              // Parse whatsapp:+14072896614 format
+              const phone = whatsappPhoneData.replace('whatsapp:', '');
+              const match = phone.match(/^(\+\d{1,3})(\d+)$/);
+              if (match) {
+                setWhatsappCountryCode(match[1]);
+                setWhatsappPhone(match[2]);
+              }
+            }
+          }
         }
       } catch (error) {
         console.error('Error loading organization:', error);
@@ -105,6 +129,49 @@ export default function Settings() {
       alert('Failed to disconnect Google account');
     } finally {
       setIsDisconnecting(false);
+    }
+  };
+
+  const handleWhatsAppSave = async () => {
+    if (!currentUser?.uid) {
+      setWhatsappMessage({ type: 'error', text: 'User not authenticated' });
+      return;
+    }
+
+    // Validate phone number
+    if (!whatsappPhone || whatsappPhone.length < 7) {
+      setWhatsappMessage({ type: 'error', text: 'Please enter a valid phone number' });
+      return;
+    }
+
+    // Remove any spaces, dashes, or parentheses
+    const cleanNumber = whatsappPhone.replace(/[\s\-\(\)]/g, '');
+
+    // Build full whatsapp phone format
+    const whatsappPhoneFormatted = `whatsapp:${whatsappCountryCode}${cleanNumber}`;
+
+    try {
+      setWhatsappSaving(true);
+      setWhatsappMessage(null);
+
+      const userRef = doc(db, 'users', currentUser.uid);
+      await updateDoc(userRef, {
+        whatsappPhone: whatsappPhoneFormatted,
+        updatedAt: serverTimestamp()
+      });
+
+      setWhatsappMessage({
+        type: 'success',
+        text: `WhatsApp linked successfully! Send /help to ${whatsappCountryCode} ${cleanNumber} to test.`
+      });
+    } catch (error) {
+      console.error('Error saving WhatsApp number:', error);
+      setWhatsappMessage({
+        type: 'error',
+        text: 'Failed to save WhatsApp number. Please try again.'
+      });
+    } finally {
+      setWhatsappSaving(false);
     }
   };
 
@@ -759,6 +826,93 @@ export default function Settings() {
           </div>
         </div>
       )}
+
+      {/* WhatsApp Integration */}
+      <div className="bg-slate-800 rounded-lg shadow-lg p-6 border border-slate-700">
+        <h2 className="text-xl font-bold text-white mb-4">📱 WhatsApp Integration</h2>
+
+        <div className="bg-slate-700/50 border border-slate-600 rounded-lg p-4 mb-6">
+          <p className="text-slate-300 text-sm mb-2">
+            Link your WhatsApp number to send order screenshots directly from your phone.
+          </p>
+          <p className="text-slate-400 text-xs">
+            After linking, send screenshots to <span className="font-mono text-blue-300">+1 (415) 523-8886</span> and they'll automatically appear in Order Management.
+          </p>
+        </div>
+
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-300 mb-2">
+              WhatsApp Phone Number
+            </label>
+            <div className="flex gap-2">
+              <select
+                value={whatsappCountryCode}
+                onChange={(e) => setWhatsappCountryCode(e.target.value)}
+                className="px-3 py-2 bg-slate-700 border border-slate-600 text-white rounded-lg focus:outline-none focus:border-blue-500"
+              >
+                <option value="+1">🇺🇸 +1 (US/Canada)</option>
+                <option value="+503">🇸🇻 +503 (El Salvador)</option>
+                <option value="+52">🇲🇽 +52 (Mexico)</option>
+                <option value="+504">🇭🇳 +504 (Honduras)</option>
+                <option value="+505">🇳🇮 +505 (Nicaragua)</option>
+                <option value="+506">🇨🇷 +506 (Costa Rica)</option>
+                <option value="+507">🇵🇦 +507 (Panama)</option>
+                <option value="+591">🇧🇴 +591 (Bolivia)</option>
+                <option value="+593">🇪🇨 +593 (Ecuador)</option>
+                <option value="+502">🇬🇹 +502 (Guatemala)</option>
+              </select>
+
+              <input
+                type="tel"
+                value={whatsappPhone}
+                onChange={(e) => setWhatsappPhone(e.target.value)}
+                placeholder="4072896614"
+                className="flex-1 max-w-md px-4 py-2 bg-slate-700 border border-slate-600 text-white rounded-lg focus:outline-none focus:border-blue-500"
+              />
+            </div>
+            {whatsappPhone && (
+              <p className="text-slate-300 text-sm mt-2">
+                Your WhatsApp: {whatsappCountryCode} {whatsappPhone}
+              </p>
+            )}
+            <p className="text-slate-400 text-xs mt-1">
+              Enter your WhatsApp number without spaces or dashes
+            </p>
+          </div>
+
+          <div className="bg-blue-900/20 border border-blue-800 rounded-lg p-4">
+            <h4 className="text-blue-300 font-medium mb-2">📋 How to Use:</h4>
+            <ol className="text-slate-300 text-sm space-y-1 list-decimal list-inside">
+              <li>Enter your phone number above</li>
+              <li>Click "Link WhatsApp Number"</li>
+              <li>Open WhatsApp and message: <span className="font-mono text-blue-300">+1 (415) 523-8886</span></li>
+              <li>Send: <span className="font-mono text-blue-300">/help</span> to see instructions</li>
+              <li>Send customer name + screenshots to create orders</li>
+            </ol>
+          </div>
+
+          {whatsappMessage && (
+            <div
+              className={`p-4 rounded-lg ${
+                whatsappMessage.type === 'success'
+                  ? 'bg-green-900/20 border border-green-800 text-green-300'
+                  : 'bg-red-900/20 border border-red-800 text-red-300'
+              }`}
+            >
+              {whatsappMessage.text}
+            </div>
+          )}
+
+          <button
+            onClick={handleWhatsAppSave}
+            disabled={whatsappSaving || !whatsappPhone}
+            className="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg font-medium"
+          >
+            {whatsappSaving ? 'Saving...' : 'Link WhatsApp Number'}
+          </button>
+        </div>
+      </div>
 
       {/* Notification Settings */}
       <div className="bg-slate-800 rounded-lg shadow-lg p-6 border border-slate-700">
