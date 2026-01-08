@@ -1,4 +1,4 @@
-import type { Package, Customer } from '../types';
+import type { Package } from '../types';
 
 /**
  * Live Google Sheets integration service
@@ -130,7 +130,7 @@ export const syncPackageToGoogleSheets = async (pkg: Package): Promise<{ success
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 
-    const result = await response.json();
+    await response.json();
     console.log('✓ Synced to Google Sheets:', pkg.trackingNumber);
 
     return { success: true };
@@ -151,13 +151,16 @@ export const syncMultiplePackagesToGoogleSheets = async (packages: Package[]): P
 
   if (!webhookUrl) {
     console.warn('Google Sheets webhook URL not configured');
-    return;
+    throw new Error('Google Sheets webhook URL not configured');
   }
 
   try {
     const data = packages.map(formatPackageForSheets);
 
-    await fetch(webhookUrl, {
+    console.log(`📤 Syncing ${packages.length} packages to Google Sheets...`);
+    console.log('Webhook URL:', webhookUrl);
+
+    const response = await fetch(webhookUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -168,9 +171,18 @@ export const syncMultiplePackagesToGoogleSheets = async (packages: Package[]): P
       })
     });
 
+    console.log('Response status:', response.status);
+    const responseText = await response.text();
+    console.log('Response:', responseText);
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}, response: ${responseText}`);
+    }
+
     console.log(`✓ Batch synced ${packages.length} packages to Google Sheets`);
   } catch (error) {
     console.error('Failed to batch sync to Google Sheets:', error);
+    throw error;
   }
 };
 

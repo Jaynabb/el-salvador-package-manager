@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import type { Package, PackageStatus } from '../types';
-import { updatePackage, getPackageById } from '../services/firestoreClient';
+import { updatePackage } from '../services/firestoreClient';
 import { formatCurrency } from '../utils/dutyCalculator';
 import { sendPackageNotification } from '../services/smsService';
 import { addActivityLog } from '../services/firestoreClient';
@@ -142,10 +142,10 @@ const PackageList: React.FC<Props> = ({ packages, onPackageUpdated }) => {
         <div className="flex flex-col md:flex-row gap-4 mb-6">
           <input
             type="text"
-            placeholder="Search by tracking, customer name, or phone..."
+            placeholder="Search: tracking, customer, phone..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="flex-1 px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-blue-500"
+            className="flex-1 px-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-blue-500 text-sm md:text-base"
           />
 
           <select

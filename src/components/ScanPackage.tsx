@@ -64,8 +64,13 @@ const ScanPackage: React.FC<Props> = ({ onPackageAdded }) => {
           });
         }
 
-        // Analyze with AI
-        const base64Image = dataUrl.split(',')[1];
+        // Analyze with AI - check for valid format
+        const parts = dataUrl.split(',');
+        if (parts.length < 2) {
+          console.error('Invalid data URL format');
+          continue;
+        }
+        const base64Image = parts[1];
         const result = await analyzePackagePhoto(base64Image);
 
         const items = result.items;

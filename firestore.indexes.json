@@ -1,0 +1,29 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "packages",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "organizationId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "exportHistory",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "exportedAt",
+          "order": "DESCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

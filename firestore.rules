@@ -1,0 +1,212 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper function to check if user is authenticated
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Helper function to get user data
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Helper function to check if user is master admin
+    function isMasterAdmin() {
+      return isSignedIn() && getUserData().role == 'master-admin';
+    }
+
+    // Helper function to check if user is organization owner
+    function isOrganizationOwner(orgId) {
+      let org = get(/databases/$(database)/documents/organizations/$(orgId)).data;
+      return isSignedIn() && org.ownerId == request.auth.uid;
+    }
+
+    // Helper function to check if user belongs to organization
+    function belongsToOrganization(orgId) {
+      return isSignedIn() && getUserData().organizationId == orgId;
+    }
+
+    // Helper function to check if organization is active
+    function isOrganizationActive(orgId) {
+      let org = get(/databases/$(database)/documents/organizations/$(orgId)).data;
+      return org.subscriptionStatus in ['active', 'trialing'];
+    }
+
+    // Users collection
+    match /users/{userId} {
+      // TEMPORARY: Allow unauthenticated read/list/update for local testing (WhatsApp integration)
+      // TODO: Remove this and implement proper authentication
+      allow read, list, update: if true;
+
+      // Users can read their own document
+      allow read: if isSignedIn() && request.auth.uid == userId;
+
+      // Allow newly authenticated users to create their own document (for signup)
+      allow create: if isSignedIn() && request.auth.uid == userId;
+
+      // Users can update their own document
+      allow update: if isSignedIn() && request.auth.uid == userId;
+
+      // Master admins can do everything (including list all users)
+      allow read, write, list: if isMasterAdmin();
+
+      // Organization owners can read their team members
+      allow read: if isSignedIn() &&
+                     exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                     getUserData().organizationId == resource.data.organizationId;
+
+      // Organization owners can query users (needed for re-adding removed members)
+      allow list: if isSignedIn() && getUserData().role == 'organization-owner';
+
+      // Organization owners can create, update, and delete users in their organization
+      allow create: if isSignedIn() &&
+                       getUserData().role == 'organization-owner' &&
+                       request.resource.data.organizationId == getUserData().organizationId;
+
+      allow update: if isSignedIn() &&
+                       getUserData().role == 'organization-owner';
+
+      allow delete: if isSignedIn() &&
+                       getUserData().role == 'organization-owner' &&
+                       getUserData().organizationId == resource.data.organizationId;
+    }
+
+    // Organizations collection
+    match /organizations/{orgId} {
+      // Allow creation by authenticated users (for signup)
+      allow create: if isSignedIn() && request.resource.data.ownerId == request.auth.uid;
+
+      // Master admins can do everything (including list all organizations)
+      allow read, write, list: if isMasterAdmin();
+
+      // Organization members can read their organization
+      // Checked AFTER master admin to avoid duplicate get() calls
+      allow read: if isSignedIn() &&
+                     exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                     get(/databases/$(database)/documents/users/$(request.auth.uid)).data.organizationId == orgId;
+
+      // Organization members can update the activeGoogleDocId field (for export tracking)
+      allow update: if isSignedIn() &&
+                       belongsToOrganization(orgId) &&
+                       request.resource.data.diff(resource.data).affectedKeys().hasOnly(['activeGoogleDocId', 'updatedAt']);
+
+      // Organization owners can update their organization (full access)
+      allow update: if isSignedIn() && isOrganizationOwner(orgId);
+    }
+
+    // Organization Invites
+    match /organizationInvites/{inviteId} {
+      // Organization owners can create invites
+      allow create: if isSignedIn() && isOrganizationOwner(request.resource.data.organizationId);
+
+      // Users can read invites sent to their email
+      allow read: if isSignedIn() && request.auth.token.email == resource.data.email;
+
+      // Organization members can read their org's invites
+      allow read: if isSignedIn() && belongsToOrganization(resource.data.organizationId);
+
+      // Organization owners can update/delete their invites
+      allow update, delete: if isSignedIn() && isOrganizationOwner(resource.data.organizationId);
+    }
+
+    // Batches - scoped to organization with subscription check
+    match /batches/{batchId} {
+      allow read, write: if isSignedIn() &&
+                           exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                           belongsToOrganization(request.resource.data.organizationId) &&
+                           isOrganizationActive(getUserData().organizationId);
+
+      allow read: if isSignedIn() &&
+                     exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                     belongsToOrganization(resource.data.organizationId);
+    }
+
+    // Screenshots - scoped to organization
+    match /screenshots/{screenshotId} {
+      allow create: if isSignedIn() &&
+                       exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                       belongsToOrganization(request.resource.data.organizationId);
+
+      allow read: if isSignedIn() &&
+                     exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                     belongsToOrganization(resource.data.organizationId);
+
+      allow update, delete: if isSignedIn() && belongsToOrganization(resource.data.organizationId);
+    }
+
+    // Packages - scoped to organization
+    match /packages/{packageId} {
+      // TEMPORARY: Allow unauthenticated read for local testing
+      // TODO: Remove this and implement proper authentication
+      allow read: if true;
+
+      // Master admins can read all packages
+      allow read: if isMasterAdmin();
+
+      allow create: if isSignedIn() &&
+                       exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                       belongsToOrganization(request.resource.data.organizationId);
+
+      allow read: if isSignedIn() &&
+                     exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                     belongsToOrganization(resource.data.organizationId);
+
+      allow update, delete: if isSignedIn() && belongsToOrganization(resource.data.organizationId);
+    }
+
+    // Customers - scoped to organization
+    match /customers/{customerId} {
+      allow read, write: if isSignedIn() &&
+                           exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                           belongsToOrganization(resource.data.organizationId);
+    }
+
+    // Orders - scoped to organization (subcollection)
+    match /organizations/{orgId}/orders/{orderId} {
+      // Master admins can read all orders
+      allow read: if isMasterAdmin();
+
+      // Create orders if user belongs to the organization
+      allow create: if isSignedIn() &&
+                       exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                       belongsToOrganization(orgId);
+
+      // Read orders if user belongs to the organization
+      allow read: if isSignedIn() &&
+                     exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                     belongsToOrganization(orgId);
+
+      // Update/delete orders if user belongs to the organization
+      allow update, delete: if isSignedIn() &&
+                               exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                               belongsToOrganization(orgId);
+    }
+
+    // Importers collection (legacy) - master admins only
+    match /importers/{importerId} {
+      allow read, write: if isMasterAdmin();
+    }
+
+    // Export History - master admins can read all, organizations can write their own
+    match /exportHistory/{exportId} {
+      // Master admins can read all export history
+      allow read: if isMasterAdmin();
+
+      // Organization members can create export records for their organization (simplified check)
+      allow create: if isSignedIn() &&
+                       request.resource.data.organizationId != null &&
+                       get(/databases/$(database)/documents/users/$(request.auth.uid)).data.organizationId == request.resource.data.organizationId;
+
+      // Organization members can read their own export history
+      allow read: if isSignedIn() &&
+                     get(/databases/$(database)/documents/users/$(request.auth.uid)).data.organizationId == resource.data.organizationId;
+    }
+
+    // Deny all other access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

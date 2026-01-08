@@ -1,0 +1,22 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Helper function to check if user is authenticated
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Screenshots - scoped to organization
+    match /screenshots/{orgFolder}/{allPaths=**} {
+      // Allow authenticated users to read/write screenshots
+      // orgFolder format: org_{organizationId}
+      allow read, write: if isSignedIn();
+    }
+
+    // Default: deny all other access
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

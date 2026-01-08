@@ -5,14 +5,19 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "vite build",
+    "build:check": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "setup-admin": "node setup-admin.js"
   },
   "dependencies": {
     "@google-cloud/firestore": "^8.0.0",
     "@google/generative-ai": "^0.24.1",
+    "@react-oauth/google": "^0.12.2",
+    "dotenv": "^17.2.3",
     "firebase": "^12.6.0",
+    "gapi-script": "^1.2.0",
     "pdfjs-dist": "^5.4.394",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"

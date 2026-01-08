@@ -73,6 +73,20 @@ function initializeSheet() {
 }
 
 /**
+ * Handle OPTIONS request for CORS preflight
+ */
+function doOptions() {
+  return ContentService.createTextOutput('')
+    .setMimeType(ContentService.MimeType.TEXT)
+    .setHeaders({
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Max-Age': '86400'
+    });
+}
+
+/**
  * Main webhook handler - receives POST requests from ImportFlow
  */
 function doPost(e) {
@@ -97,20 +111,32 @@ function doPost(e) {
         return ContentService.createTextOutput(JSON.stringify({
           success: false,
           error: 'Unknown action'
-        })).setMimeType(ContentService.MimeType.JSON);
+        }))
+        .setMimeType(ContentService.MimeType.JSON)
+        .setHeaders({
+          'Access-Control-Allow-Origin': '*'
+        });
     }
 
     return ContentService.createTextOutput(JSON.stringify({
       success: true,
       message: 'Data synced successfully'
-    })).setMimeType(ContentService.MimeType.JSON);
+    }))
+    .setMimeType(ContentService.MimeType.JSON)
+    .setHeaders({
+      'Access-Control-Allow-Origin': '*'
+    });
 
   } catch (error) {
     Logger.log('Error: ' + error.toString());
     return ContentService.createTextOutput(JSON.stringify({
       success: false,
       error: error.toString()
-    })).setMimeType(ContentService.MimeType.JSON);
+    }))
+    .setMimeType(ContentService.MimeType.JSON)
+    .setHeaders({
+      'Access-Control-Allow-Origin': '*'
+    });
   }
 }
 
