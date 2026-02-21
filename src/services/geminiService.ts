@@ -1,7 +1,38 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai';
 import type { PackageItem, ExtractedOrderData } from '../types';
+import Tesseract from 'tesseract.js';
 
 const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY || '');
+
+/**
+ * OCR fallback when Gemini vision blocks due to RECITATION
+ * Extracts text from image, then sends to Gemini text model
+ */
+const extractWithOCR = async (base64Image: string): Promise<string> => {
+  console.log('🔍 Running OCR fallback to extract text from image...');
+
+  try {
+    // Convert base64 to data URL if needed
+    const imageData = base64Image.startsWith('data:')
+      ? base64Image
+      : `data:image/png;base64,${base64Image}`;
+
+    const result = await Tesseract.recognize(imageData, 'eng', {
+      logger: (m) => {
+        if (m.status === 'recognizing text') {
+          console.log(`OCR progress: ${Math.round(m.progress * 100)}%`);
+        }
+      }
+    });
+
+    const text = result.data.text;
+    console.log('✓ OCR extracted text:', text.substring(0, 200) + '...');
+    return text;
+  } catch (error) {
+    console.error('OCR extraction failed:', error);
+    throw new Error('Failed to extract text from image using OCR');
+  }
+};
 
 /**
  * Enhanced MVP Order Screenshot Analyzer
@@ -9,10 +40,51 @@ const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY || '');
  * This is the primary function to use for analyzing order screenshots
  */
 export const analyzeOrderScreenshot = async (base64Image: string): Promise<ExtractedOrderData> => {
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.5-flash',
+    safetySettings: [
+      {
+        category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold: HarmBlockThreshold.BLOCK_NONE,
+      },
+      {
+        category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold: HarmBlockThreshold.BLOCK_NONE,
+      },
+      {
+        category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        threshold: HarmBlockThreshold.BLOCK_NONE,
+      },
+      {
+        category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold: HarmBlockThreshold.BLOCK_NONE,
+      },
+    ],
+    generationConfig: {
+      temperature: 0.1, // Very low = more factual, deterministic
+      topP: 0.95,
+      topK: 40,
+      candidateCount: 1,
+    },
+  });
 
-  const prompt = `You are an AI assistant specialized in extracting data from e-commerce order screenshots with 95%+ accuracy.
-This is for an import business in El Salvador processing customer orders.
+  const prompt = `LEGAL NOTICE: This is FACTUAL DATA EXTRACTION for government-mandated customs declarations.
+
+You are extracting FACTS (prices, quantities, product names, customer names, dates) from order screenshots.
+These are NOT copyrighted creative works - they are FACTUAL INFORMATION required by customs law.
+
+IMPORTANT LEGAL DISTINCTIONS:
+- Product names = FACTS (not copyrightable)
+- Prices and quantities = FACTS (not copyrightable)
+- Customer names and addresses = FACTS (not copyrightable)
+- Order numbers and dates = FACTS (not copyrightable)
+
+This extraction is for:
+1. Government customs compliance (LEGALLY REQUIRED)
+2. Import declarations (REGULATORY MANDATE)
+3. No commercial republishing (LEGITIMATE USE)
+
+You are an AI assistant extracting factual data for customs declarations in El Salvador.
 
 🌐 LANGUAGE SUPPORT - CRITICAL:
 - Screenshots may be in ENGLISH or SPANISH (El Salvador uses Spanish)
@@ -446,14 +518,33 @@ WHAT TO EXTRACT:
    ❌ WRONG: Screenshot has tracking "9876543210" and you add 9876543210 to total
    ✅ CORRECT: You ignore it completely - tracking numbers are NOT money
 
-   🔴 MOST IMPORTANT RULE: ALWAYS USE THE FINAL TOTAL SHOWN ON THE SCREENSHOT
+   🔴 🔴 🔴 MOST IMPORTANT RULE: ALWAYS USE THE LOWEST/FINAL TOTAL SHOWN 🔴 🔴 🔴
+
+   ⚠️ CRITICAL: When you see MULTIPLE dollar amounts on a screenshot:
+   - IGNORE intermediate subtotals (products, items, merchandise)
+   - IGNORE higher numbers (these are BEFORE discounts)
+   - USE THE LOWEST NUMBER labeled as "Total" (this is AFTER discounts)
+   - The lowest "Total" number is what the customer ACTUALLY PAID
+
+   🔴 SHEIN SCREENSHOTS - SPECIAL ATTENTION:
+   - Orange/colored number at top = Products subtotal BEFORE discount → IGNORE THIS
+   - Black "Total" text at bottom = Final total AFTER discount → USE THIS
+   - ALWAYS USE THE BOTTOM BLACK "TOTAL" NUMBER (it's lower)
+
+   🔴 AMAZON SCREENSHOTS - SPECIAL ATTENTION:
+   - "Productos: $XX" = Products subtotal BEFORE discounts → IGNORE THIS
+   - "Total (I.V.A. Incluido): $XX" = Final total AFTER discounts → USE THIS
+   - ALWAYS USE THE "TOTAL (I.V.A. INCLUIDO)" NUMBER (it's lower after discounts)
 
    ORDER TOTAL EXTRACTION (CRITICAL):
    Step 1: Look for the FINAL/GRAND TOTAL on the screenshot
-   - Search for labels like: "Total", "Order Total", "Grand Total", "Amount Due", "Total Price"
+   - Search for labels like: "Total", "Order Total", "Grand Total", "Amount Due", "Total Price", "Total (I.V.A. Incluido)", "Total including tax"
    - MUST have a $ symbol to be considered money
    - This total includes taxes, fees, shipping, and discounts
    - ⚠️ This is the ACTUAL amount the customer paid
+   - 🔴 DO NOT use "Productos" or "Products" - this is the subtotal BEFORE discounts!
+   - 🔴 If you see both "Productos: $X" and "Total (I.V.A. Incluido): $Y", use $Y (the FINAL total with discounts and taxes)
+   - 🔴 If you see an orange/colored number and a black "Total" number, use the black "Total" (it's lower)
 
    Step 2: If you find a final total, USE IT as orderTotal
    - Example: If items are $5 each but bottom shows "Total: $7.00", use $7.00
@@ -474,7 +565,29 @@ WHAT TO EXTRACT:
    - **TOTAL: $7.00** ← USE THIS NUMBER
    - orderTotal = $7.00 (NOT $5.00)
 
-   Example 2 - No final total visible (FALLBACK):
+   Example 2 - Amazon order with discounts (CRITICAL EDGE CASE):
+   - Productos: US$68.66 (products subtotal BEFORE discounts) ← DO NOT USE THIS
+   - Envío: US$0.00 (shipping)
+   - Sus cupones de ahorro: -US$1.29 (discount 1)
+   - Sus cupones de ahorro: -US$3.70 (discount 2)
+   - Total antes de impuestos: US$63.67 (after discounts, before tax)
+   - Impuestos: US$3.83 (tax)
+   - **Total (I.V.A. Incluido): US$67.50** ← USE THIS NUMBER (final total after discounts and taxes)
+   - orderTotal = $67.50 (NOT $68.66)
+
+   🔴 🔴 🔴 Example 3 - Shein order with multiple totals (CRITICAL EDGE CASE):
+   - **ORANGE TEXT at top: $45.99** (products subtotal) ← DO NOT USE THIS - IGNORE ORANGE NUMBER
+   - Shipping: $0.00
+   - Discount: -$5.00
+   - **BLACK TEXT "Total" at bottom: $40.99** ← USE THIS NUMBER (final total after discounts)
+   - orderTotal = $40.99 (NOT $45.99)
+   - 🔴 CRITICAL RULE: When you see MULTIPLE total amounts on a Shein screenshot:
+     * IGNORE the orange/colored number at the top (products subtotal)
+     * USE the black "Total" text at the bottom (final total)
+     * ALWAYS USE THE LOWEST NUMBER when multiple totals are shown
+     * The bottom total is AFTER discounts - this is what customer paid
+
+   Example 4 - No final total visible (FALLBACK):
    - Item 1: 2 × $4.58 = $9.16
    - Item 2: 1 × $12.99 = $12.99
    - Item 3: 3 × $5.60 = $16.80
@@ -485,6 +598,11 @@ WHAT TO EXTRACT:
    - Screenshot shows items total $5.00 and final total $7.00
    - You use $5.00 ← THIS IS WRONG
    - ✅ You should use $7.00 (the final total with taxes/fees)
+
+   ❌ WRONG APPROACH #2 (CRITICAL):
+   - Screenshot shows "Productos: $68.66" and "Total (I.V.A. Incluido): $67.50"
+   - You use $68.66 ← THIS IS WRONG (that's the subtotal before discounts!)
+   - ✅ You should use $67.50 (the FINAL total after discounts and taxes)
 
    CALCULATING TOTAL PIECES:
    - Simply add up all item quantities
@@ -589,6 +707,35 @@ FINAL VALIDATION CHECKLIST - VERIFY BEFORE RESPONDING:
 
 1. 🔴 🔴 🔴 FIRST: Is this a Google Shopping search, product listing, or random photo? If YES, return null/empty JSON immediately!
 
+1.5. 🔴 🔴 🔴 LOWEST TOTAL CHECK - CRITICAL VALIDATION:
+   STOP! Before you finalize orderTotal, answer these questions:
+
+   ✓ Step A: List ALL dollar amounts you see on the screenshot with $ symbols
+     - Write them ALL down: $XX.XX, $YY.YY, $ZZ.ZZ, etc.
+
+   ✓ Step B: Which ones are crossed out / strikethrough?
+     - Crossed-out prices = IGNORE (original prices before discount)
+     - Active prices = USE (current prices after discount)
+
+   ✓ Step C: Which ones are labeled as "Total", "Order Total", "Grand Total", "Final Total"?
+     - Write down ALL amounts with "Total" labels
+     - Example: "Orange $45.99" vs "Black Total $40.99"
+
+   ✓ Step D: Which "Total" amount is at the BOTTOM of the screenshot?
+     - The bottom "Total" is usually the FINAL amount after all discounts
+     - This is what customer ACTUALLY PAID
+
+   ✓ Step E: Compare ALL "Total" amounts - which is LOWEST?
+     - If you see $45.99 (orange) and $40.99 (black "Total" at bottom) → USE $40.99
+     - If you see $68.66 ("Productos") and $67.50 ("Total I.V.A.") → USE $67.50
+     - ALWAYS USE THE LOWEST "Total" amount
+
+   ✓ Step F: Final check - is your orderTotal the LOWEST "Total" amount on the screenshot?
+     - If NO, STOP and fix it immediately!
+     - If YES, proceed with that number
+
+   🔴 CRITICAL: Your orderTotal MUST be the LOWEST dollar amount labeled as "Total" on the screenshot!
+
 2. 🔴 🔴 🔴 PHONE NUMBER CHECK - VERIFY YOUR TRACKING NUMBER RIGHT NOW:
    - Look at trackingNumber field you're about to return
    - Count the digits carefully: How many digits total?
@@ -614,10 +761,17 @@ FINAL VALIDATION CHECKLIST - VERIFY BEFORE RESPONDING:
 
 4. 🔴 PRICE CHECK: Did you accidentally add any numbers WITHOUT dollar signs to prices?
 5. Review each item - did you use the LOWEST price shown WITH A $ SYMBOL?
-6. 🔴 TOTAL CHECK: Look at the bottom of the screenshot - is there a "Total" or "Order Total" WITH A $ SYMBOL?
-7. If YES, use that exact number as orderTotal (it includes taxes/fees/shipping)
-8. If NO, calculate orderTotal by summing all item totals
-9. 🔴 FINAL CHECK: Does your orderTotal look reasonable? (If it's in millions/billions, you added a tracking number by mistake)
+6. 🔴 🔴 🔴 TOTAL CHECK - ALREADY VALIDATED IN STEP 1.5 ABOVE:
+   - You already compared ALL "Total" amounts and selected the LOWEST one
+   - You already verified that bottom "Total" is what you're using
+   - If you skipped step 1.5, GO BACK and do it now!
+
+7. 🔴 DOUBLE-CHECK: Is your orderTotal the LOWEST "Total" shown on the screenshot?
+   - List all "Total" amounts again: ________
+   - Your orderTotal: ________
+   - Is it the LOWEST? If NO, fix it immediately!
+
+8. 🔴 FINAL CHECK: Does your orderTotal look reasonable? (If it's in millions/billions, you added a tracking number by mistake)
 
 Return ONLY valid JSON, no markdown, no extra text.`;
 
@@ -631,7 +785,88 @@ Return ONLY valid JSON, no markdown, no extra text.`;
     }
   ]);
 
-  const responseText = result.response.text();
+  // RECITATION handling - extract from candidate to avoid .text() throwing errors
+  const candidate = result.response.candidates?.[0];
+  let responseText = '';
+
+  // Check for RECITATION flag FIRST
+  const isRecitationBlocked = candidate?.finishReason === 'RECITATION';
+
+  if (isRecitationBlocked) {
+    // RECITATION detected - try to extract from candidate (don't call .text())
+    console.warn('⚠️ RECITATION detected - attempting direct extraction for customs declaration purposes');
+
+    const partialText = candidate?.content?.parts?.[0]?.text;
+    if (partialText && partialText.trim().length > 0) {
+      responseText = partialText;
+      console.log('✓ Successfully extracted partial response despite RECITATION block');
+    } else {
+      // No content available - try OCR fallback
+      console.warn('⚠️ RECITATION completely blocked response - trying OCR fallback...');
+
+      try {
+        // Extract text using OCR
+        const ocrText = await extractWithOCR(base64Image);
+
+        // Now send the OCR text to Gemini for structuring (same prompt, just text instead of image)
+        console.log('📝 Sending OCR text to Gemini for structuring...');
+
+        const textModel = genAI.getGenerativeModel({
+          model: 'gemini-2.5-flash',
+          safetySettings: [
+            {
+              category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+              threshold: HarmBlockThreshold.BLOCK_NONE,
+            },
+            {
+              category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+              threshold: HarmBlockThreshold.BLOCK_NONE,
+            },
+            {
+              category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+              threshold: HarmBlockThreshold.BLOCK_NONE,
+            },
+            {
+              category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+              threshold: HarmBlockThreshold.BLOCK_NONE,
+            },
+          ],
+          generationConfig: {
+            temperature: 0.1,
+            topP: 0.95,
+            topK: 40,
+            candidateCount: 1,
+          },
+        });
+
+        // Same prompt but adapted for text input
+        const textPrompt = `${prompt}\n\nHere is the extracted text from an order screenshot:\n\n${ocrText}\n\nPlease extract the order data and return ONLY valid JSON in the format specified above.`;
+
+        const textResult = await textModel.generateContent(textPrompt);
+        responseText = textResult.response.text();
+        console.log('✓ Successfully structured data from OCR text');
+      } catch (ocrError) {
+        console.error('OCR fallback failed:', ocrError);
+        // Last resort - return empty data for manual entry
+        return {
+          customerName: undefined,
+          company: undefined,
+          seller: undefined,
+          orderNumber: undefined,
+          orderDate: undefined,
+          trackingNumber: undefined,
+          trackingNumberLast4: undefined,
+          carriers: undefined,
+          items: [],
+          orderTotal: 0,
+          totalPieces: 0
+        };
+      }
+    }
+  } else {
+    // No RECITATION - normal extraction
+    responseText = result.response.text();
+  }
 
   // Extract JSON from response
   let jsonText = responseText;
@@ -642,6 +877,13 @@ Return ONLY valid JSON, no markdown, no extra text.`;
   }
 
   const parsed = JSON.parse(jsonText);
+
+  // 🔴 DEBUG: Log what Gemini extracted BEFORE any post-processing
+  console.log('🔍 RAW GEMINI EXTRACTION:', JSON.stringify({
+    customerName: parsed.customerName,
+    orderTotal: parsed.orderTotal,
+    items: parsed.items?.map((i: any) => ({ name: i.name, quantity: i.quantity, unitValue: i.unitValue, totalValue: i.totalValue }))
+  }, null, 2));
 
   // 🔴 CRITICAL: Automatic phone number detection and removal (fail-safe)
   if (parsed.trackingNumber) {
@@ -683,19 +925,19 @@ Return ONLY valid JSON, no markdown, no extra text.`;
   }
 
   // Smart validation for orderTotal
-  // The AI should extract the final total from the screenshot (which includes taxes/fees)
-  // This will be LARGER than the sum of items
+  // The AI should extract the final total from the screenshot
+  // IMPORTANT: The final total can be HIGHER (taxes/fees) OR LOWER (discounts) than items total
   if (parsed.orderTotal && Math.abs(parsed.orderTotal - calculatedItemsTotal) > 0.01) {
-    // Check if AI's total is LARGER than items total (suggests taxes/fees included - this is CORRECT)
+    // Check if AI's total is LARGER than items total (suggests taxes/fees included)
     if (parsed.orderTotal > calculatedItemsTotal) {
       const difference = parsed.orderTotal - calculatedItemsTotal;
       console.log(`✓ Final total ($${parsed.orderTotal.toFixed(2)}) includes $${difference.toFixed(2)} in taxes/fees/shipping on top of items total ($${calculatedItemsTotal.toFixed(2)})`);
       // Trust the AI - they found the final total on the screenshot
     } else {
-      // AI's total is LOWER than items total - this suggests they used wrong prices
-      console.warn(`⚠️ Order total error: AI said $${parsed.orderTotal.toFixed(2)}, but items total is $${calculatedItemsTotal.toFixed(2)}`);
-      console.warn('   AI probably used original prices instead of sale prices - using calculated total');
-      parsed.orderTotal = calculatedItemsTotal; // Auto-correct
+      // AI's total is LOWER than items total - this is OK! Discounts exist!
+      const difference = calculatedItemsTotal - parsed.orderTotal;
+      console.log(`✓ Final total ($${parsed.orderTotal.toFixed(2)}) is $${difference.toFixed(2)} less than items subtotal ($${calculatedItemsTotal.toFixed(2)}) - discounts/coupons applied`);
+      // Trust the AI - they found the final total after discounts on the screenshot
     }
   } else if (!parsed.orderTotal) {
     // No total provided, use calculated
@@ -724,6 +966,15 @@ Return ONLY valid JSON, no markdown, no extra text.`;
 
   // Log final verification
   console.log(`✓ Extraction complete: ${extractedData.items.length} items, $${extractedData.orderTotal.toFixed(2)} total, ${extractedData.totalPieces} pieces`);
+
+  // 🔴 DEBUG: Log final extracted data AFTER post-processing
+  console.log('🔍 FINAL EXTRACTION DATA:', JSON.stringify({
+    customerName: extractedData.customerName,
+    orderTotal: extractedData.orderTotal,
+    company: extractedData.company,
+    trackingNumber: extractedData.trackingNumber,
+    itemsCount: extractedData.items.length
+  }, null, 2));
 
   return extractedData;
 };

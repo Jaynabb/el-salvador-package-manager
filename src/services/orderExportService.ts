@@ -366,68 +366,49 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
     index += 1; // Images take up 1 character position
   };
 
-  // Format each order
+  // Format each order - SIMPLE format with only 4 fields + screenshots
+  // If user manually edits any of these 4 fields in the table, export shows their edits
   for (const [orderIndex, order] of orders.entries()) {
-    // Customer Name (bold) - this is the consignee
+    // 1. Customer Name (bold) - uses exact value from table (order.consignee)
     if (order.consignee) {
       insertBoldText(order.consignee);
       insertText('\n');
     }
 
-    // Package Number
+    // 2. Package Number - uses exact value from table (order.packageNumber)
     if (order.packageNumber) {
       insertText(`${order.packageNumber}\n`);
     }
 
-    // Carrier + Tracking in format: "USPS #2423"
-    let carrier = '';
-    if (order.parcelComp) {
-      carrier = order.parcelComp;
-    } else if (order.trackingNumber) {
-      const tracking = order.trackingNumber;
-      // Auto-detect carrier from tracking format
-      if (tracking.startsWith('1Z')) {
-        carrier = 'UPS';
-      } else if (tracking.length === 12 && /^\d+$/.test(tracking)) {
-        carrier = 'FedEx';
-      } else if (tracking.length >= 20) {
-        carrier = 'USPS';
-      } else {
-        carrier = 'USPS';
-      }
-    }
+    // 3. Carrier + Tracking (last 4 digits) - uses exact values from table
+    // Tracking: Uses order.trackingNumber if manually entered, otherwise falls back to merchantTrackingNumber
+    // Carrier: Uses order.parcelComp (user can edit this in the table)
+    const trackingToUse = order.trackingNumber || order.merchantTrackingNumber || order.orderNumber || '';
+    const carrierName = order.parcelComp || '[Carrier]';
 
-    // Combined carrier and tracking line
-    if (order.trackingNumber) {
-      const tracking = order.trackingNumber;
-      const lastFour = tracking.slice(-4);
-      const carrierName = carrier || '[Carrier]'; // Placeholder if no carrier
-      insertText(`${carrierName} #${lastFour}\n`);
-    } else if (order.orderNumber) {
-      // Fallback to order number
-      const lastFour = order.orderNumber.slice(-4);
-      const carrierName = carrier || '[Carrier]';
+    if (trackingToUse) {
+      const lastFour = trackingToUse.slice(-4);
       insertText(`${carrierName} #${lastFour}\n`);
     } else {
-      // No tracking at all - show placeholder
       insertText('[Carrier] #[----]\n');
     }
 
-    // Value
+    // 4. Value - uses exact value from table (order.value)
+    // This reflects any manual edits the user made to the value field
     if (order.value) {
       insertText(`VALOR: $${Number(order.value).toFixed(2)}\n`);
     }
 
-    // Insert ALL screenshots for this customer (compact spacing to prevent page breaks)
+    // 5. Screenshots - insert ALL screenshots for this order
     if (order.screenshotUrls && order.screenshotUrls.length > 0) {
       for (const screenshotUrl of order.screenshotUrls) {
         await insertImage(screenshotUrl);
-        insertText(' '); // Add just a space between images (not a line break)
+        insertText(' ');
       }
-      insertText('\n'); // Single line break after all images
+      insertText('\n');
     }
 
-    // Add minimal spacing between orders (except after last one)
+    // Add spacing between orders
     if (orderIndex < orders.length - 1) {
       insertText('\n');
     }
@@ -451,6 +432,16 @@ export const exportOrdersToGoogleDocs = async (
       return { success: false, error: 'No orders to export' };
     }
 
+    // Sort orders alphabetically by customer name (first name, then last name)
+    // Example: "James Allen" comes before "James Brown"
+    // localeCompare() compares the full name character-by-character
+    const sortedOrders = [...orders].sort((a, b) => {
+      const nameA = (a.consignee || '').toLowerCase().trim();
+      const nameB = (b.consignee || '').toLowerCase().trim();
+      return nameA.localeCompare(nameB);
+    });
+    console.log('✓ Orders sorted alphabetically by customer name (first name, then last name)');
+
     // Get valid access token
     console.log('🔑 Getting access token for organization:', organizationId);
     const accessToken = await getValidAccessToken(organizationId);
@@ -465,7 +456,7 @@ export const exportOrdersToGoogleDocs = async (
     const folderId = org.googleDriveFolderId;
 
     // Create or append to document
-    const { docId, isNew } = await createOrAppendOrderDocument(orders, accessToken, organizationId, folderId);
+    const { docId, isNew } = await createOrAppendOrderDocument(sortedOrders, accessToken, organizationId, folderId);
 
     // Return success with URL
     const docUrl = `https://docs.google.com/document/d/${docId}`;
@@ -477,11 +468,11 @@ export const exportOrdersToGoogleDocs = async (
         docUrl,
         organizationId,
         organizationName: org.organizationName,
-        orderCount: orders.length,
-        customerNames: [...new Set(orders.map(o => o.consignee).filter(Boolean))], // Unique customer names
-        packageNumbers: orders.map(o => o.packageNumber).filter(Boolean),
-        screenshotUrls: orders.flatMap(o => o.screenshotUrls || []), // All screenshots
-        totalValue: orders.reduce((sum, o) => sum + (o.value || 0), 0),
+        orderCount: sortedOrders.length,
+        customerNames: [...new Set(sortedOrders.map(o => o.consignee).filter(Boolean))], // Unique customer names (sorted)
+        packageNumbers: sortedOrders.map(o => o.packageNumber).filter(Boolean),
+        screenshotUrls: sortedOrders.flatMap(o => o.screenshotUrls || []), // All screenshots
+        totalValue: sortedOrders.reduce((sum, o) => sum + (o.value || 0), 0),
         exportedBy: exportedBy || 'unknown',
         exportedAt: new Date(),
         isNewDoc: isNew,

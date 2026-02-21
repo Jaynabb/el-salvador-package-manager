@@ -2,10 +2,11 @@ import React, { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { analyzeOrderScreenshot } from '../services/geminiService';
 import { loadGoogleAPIs, openDrivePicker } from '../services/googleDrivePicker';
-import { collection, addDoc, getDocs, query, orderBy } from 'firebase/firestore';
+import { collection, addDoc, getDocs, query, orderBy, doc, updateDoc, increment, Timestamp } from 'firebase/firestore';
 import { db, storage } from '../services/firebase';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import type { OrderRow } from './OrderManagement';
+import type { PackageItem } from '../types';
 
 interface UploadedFile {
   id: string;
@@ -88,6 +89,30 @@ export default function BulkScreenshotUpload() {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(names));
     } catch (error) {
       console.error('Error saving customer name to localStorage:', error);
+    }
+  };
+
+  // Helper function to track AI extraction usage for billing
+  const trackAIExtraction = async (organizationId: string) => {
+    if (!organizationId || !db) return;
+
+    try {
+      const orgRef = doc(db, 'organizations', organizationId);
+      const costPerExtraction = 0.0025; // $0.0025 per extraction (Gemini 2.5 Flash)
+
+      await updateDoc(orgRef, {
+        aiExtractionsCount: increment(1),
+        totalAICost: increment(costPerExtraction),
+        currentMonthExtractions: increment(1),
+        currentMonthCost: increment(costPerExtraction),
+        lastExtractionAt: Timestamp.now(),
+        updatedAt: Timestamp.now()
+      });
+
+      console.log(`✓ Tracked AI extraction for org ${organizationId}: +$${costPerExtraction.toFixed(4)}`);
+    } catch (error) {
+      console.error('Error tracking AI extraction:', error);
+      // Non-critical error - don't block the user flow
     }
   };
 
@@ -235,6 +260,11 @@ export default function BulkScreenshotUpload() {
         // AI extraction
         const extractedData = await analyzeOrderScreenshot(base64);
 
+        // Track AI extraction usage for billing
+        if (currentUser?.organizationId) {
+          await trackAIExtraction(currentUser.organizationId);
+        }
+
         setFiles(prev => prev.map(f =>
           f.id === file.id ? { ...f, extractionProgress: 75 } : f
         ));
@@ -265,15 +295,17 @@ export default function BulkScreenshotUpload() {
           ));
         }, 1000);
 
-      } catch (error) {
+      } catch (error: any) {
         console.error('Error extracting customer name:', error);
-        // Set to pending even if extraction fails - user can manually enter
+
+        // Set to pending - user can manually enter customer name
+        // Don't show technical error messages to user
         setFiles(prev => prev.map(f =>
           f.id === file.id ? {
             ...f,
             status: 'pending' as const,
             extractionProgress: undefined,
-            error: 'Name extraction failed - please enter manually'
+            error: undefined // Clear error - manual entry is normal workflow
           } : f
         ));
       }
@@ -330,6 +362,7 @@ export default function BulkScreenshotUpload() {
           const carriersSet = new Set<string>(); // Collect all unique carriers
           const trackingNumbersSet = new Set<string>(); // Collect all unique tracking numbers
           const orderNumbersSet = new Set<string>(); // Collect all unique order numbers
+          const allItems: PackageItem[] = []; // Collect all items from all screenshots
 
           for (const file of customerFiles) {
             // Use cached extraction data if available, otherwise extract now
@@ -345,6 +378,11 @@ export default function BulkScreenshotUpload() {
 
               // AI extraction (fallback if not cached)
               extractedData = await analyzeOrderScreenshot(base64);
+
+              // Track AI extraction usage for billing
+              if (currentUser?.organizationId) {
+                await trackAIExtraction(currentUser.organizationId);
+              }
             }
 
             // Upload screenshot to Firebase Storage
@@ -353,7 +391,17 @@ export default function BulkScreenshotUpload() {
 
             // Accumulate data from all screenshots
             totalPieces += extractedData.totalPieces || 0;
-            totalValue += extractedData.orderTotal || 0;
+            const orderTotalFromExtraction = extractedData.orderTotal || 0;
+            totalValue += orderTotalFromExtraction;
+
+            // 🔴 DEBUG: Log what we're accumulating
+            console.log(`🔍 Accumulating order total: +$${orderTotalFromExtraction.toFixed(2)} → Running total: $${totalValue.toFixed(2)}`);
+            console.log('🔍 Extracted data:', { orderTotal: extractedData.orderTotal, itemsCount: extractedData.items?.length });
+
+            // Collect items from this screenshot
+            if (extractedData.items && extractedData.items.length > 0) {
+              allItems.push(...extractedData.items);
+            }
 
             // Collect ALL tracking numbers from all screenshots
             // AI may return multiple tracking numbers comma-separated, so split them
@@ -419,6 +467,15 @@ export default function BulkScreenshotUpload() {
           const day = String(now.getDate()).padStart(2, '0');
           const localDate = `${year}-${month}-${day}`;
 
+          // 🔴 DEBUG: Log what we're about to save to Firestore
+          console.log(`🔍 CREATING ORDER - About to save to Firestore:`, {
+            packageNumber: `Paquete #${packageNumber}`,
+            customerName,
+            totalValue: totalValue,
+            totalPieces: totalPieces,
+            itemsCount: allItems.length
+          });
+
           // Create ONE order for this customer with ALL their screenshots
           const orderData: any = {
             packageNumber: `Paquete #${packageNumber}`,
@@ -431,7 +488,8 @@ export default function BulkScreenshotUpload() {
             value: totalValue,
             parcelComp: parcelComp,
             screenshotUrls: screenshotUrls, // Array of ALL screenshot URLs for this customer
-            createdAt: new Date()
+            createdAt: new Date(),
+            items: allItems // Array of all items from all screenshots
           };
 
           // Only add optional fields if they have values (Firestore doesn't accept undefined)

@@ -491,6 +491,44 @@ ImportFlow Team`;
           </button>
         </div>
 
+        {/* Platform-wide Usage Stats */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+          <div className="bg-gradient-to-br from-blue-900/30 to-blue-800/30 border border-blue-700/50 rounded-lg p-4">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-blue-300 text-sm font-medium">Total Organizations</p>
+              <span className="text-2xl">🏢</span>
+            </div>
+            <p className="text-white text-3xl font-bold">{organizations.length}</p>
+          </div>
+          <div className="bg-gradient-to-br from-purple-900/30 to-purple-800/30 border border-purple-700/50 rounded-lg p-4">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-purple-300 text-sm font-medium">Total Extractions</p>
+              <span className="text-2xl">🤖</span>
+            </div>
+            <p className="text-white text-3xl font-bold">
+              {organizations.reduce((sum, org) => sum + (org.aiExtractionsCount || 0), 0)}
+            </p>
+          </div>
+          <div className="bg-gradient-to-br from-green-900/30 to-green-800/30 border border-green-700/50 rounded-lg p-4">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-green-300 text-sm font-medium">Platform Revenue</p>
+              <span className="text-2xl">💰</span>
+            </div>
+            <p className="text-white text-3xl font-bold">
+              ${organizations.reduce((sum, org) => sum + (org.totalAICost || 0), 0).toFixed(2)}
+            </p>
+          </div>
+          <div className="bg-gradient-to-br from-orange-900/30 to-orange-800/30 border border-orange-700/50 rounded-lg p-4">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-orange-300 text-sm font-medium">This Month</p>
+              <span className="text-2xl">📊</span>
+            </div>
+            <p className="text-white text-3xl font-bold">
+              ${organizations.reduce((sum, org) => sum + (org.currentMonthCost || 0), 0).toFixed(2)}
+            </p>
+          </div>
+        </div>
+
         {/* Add Organization Form */}
         {showAddOrg && (
           <div className="bg-slate-700/50 rounded-xl p-4 md:p-6 mb-6 border border-slate-600">
@@ -631,6 +669,12 @@ ImportFlow Team`;
                       <span className="px-2 py-1 rounded text-xs font-medium bg-blue-900/30 text-blue-400 border border-blue-700">
                         {orgUsers[org.id]?.length || 0} users
                       </span>
+                      <span className="px-2 py-1 rounded text-xs font-medium bg-purple-900/30 text-purple-400 border border-purple-700">
+                        {org.aiExtractionsCount || 0} extractions
+                      </span>
+                      <span className="px-2 py-1 rounded text-xs font-medium bg-green-900/30 text-green-400 border border-green-700">
+                        ${(org.totalAICost || 0).toFixed(2)} total
+                      </span>
                     </div>
                     <p className="text-slate-400 text-sm mt-1 truncate">
                       {org.contactName} • {org.contactEmail}
@@ -687,6 +731,35 @@ ImportFlow Team`;
                         <p className="text-slate-400 text-sm">Subscription</p>
                         <p className="text-white capitalize">{org.subscriptionStatus || 'N/A'}</p>
                       </div>
+                    </div>
+
+                    {/* Usage & Billing Section */}
+                    <div className="bg-gradient-to-br from-purple-900/20 to-blue-900/20 border border-purple-700/30 rounded-lg p-4 mb-6">
+                      <h5 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
+                        <span>💳</span> Usage & Billing
+                      </h5>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div className="bg-slate-800/50 rounded-lg p-3">
+                          <p className="text-slate-400 text-xs mb-1">Total Extractions</p>
+                          <p className="text-white text-2xl font-bold">{org.aiExtractionsCount || 0}</p>
+                          <p className="text-slate-500 text-xs mt-1">All-time AI analyses</p>
+                        </div>
+                        <div className="bg-slate-800/50 rounded-lg p-3">
+                          <p className="text-slate-400 text-xs mb-1">This Month</p>
+                          <p className="text-white text-2xl font-bold">{org.currentMonthExtractions || 0}</p>
+                          <p className="text-green-400 text-xs mt-1 font-semibold">${(org.currentMonthCost || 0).toFixed(3)}</p>
+                        </div>
+                        <div className="bg-slate-800/50 rounded-lg p-3">
+                          <p className="text-slate-400 text-xs mb-1">Lifetime Cost</p>
+                          <p className="text-green-400 text-2xl font-bold">${(org.totalAICost || 0).toFixed(2)}</p>
+                          <p className="text-slate-500 text-xs mt-1">@ $0.0025/extraction</p>
+                        </div>
+                      </div>
+                      {org.lastExtractionAt && (
+                        <div className="mt-3 text-xs text-slate-400">
+                          Last extraction: {new Date(org.lastExtractionAt).toLocaleString()}
+                        </div>
+                      )}
                     </div>
 
                     {/* Users Section */}

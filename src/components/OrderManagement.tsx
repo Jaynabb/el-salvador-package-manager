@@ -3,6 +3,9 @@ import { useAuth } from '../contexts/AuthContext';
 import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, query, orderBy } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { exportOrdersToGoogleDocs, startNewGoogleDoc } from '../services/orderExportService';
+import { exportOrdersToGoogleSheets, startNewGoogleSheet } from '../services/orderSheetsExportService';
+import { exportOrdersToExcel } from '../services/orderExcelExportService';
+import type { PackageItem } from '../types';
 
 export interface OrderRow {
   id: string;
@@ -21,6 +24,7 @@ export interface OrderRow {
   customerReceivedDate?: string; // Date when customer received package (manual input)
   dateDelivered?: string; // Date when package was delivered (manual input)
   screenshotUrls: string[]; // Array of Firebase Storage URLs (one customer can have multiple screenshots)
+  items?: PackageItem[]; // Array of line items extracted from screenshots
   createdAt: Date;
 }
 
@@ -29,7 +33,11 @@ export default function OrderManagement() {
   const [orders, setOrders] = useState<OrderRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
+  const [exportingSheets, setExportingSheets] = useState(false);
   const [selectedRows, setSelectedRows] = useState<Set<string>>(new Set());
+  const [showMachoteModal, setShowMachoteModal] = useState(false);
+  const [showDesarrolloConfirm, setShowDesarrolloConfirm] = useState(false);
+  const [machoteAction, setMachoteAction] = useState<'append' | 'fresh'>('append');
   const [editingCell, setEditingCell] = useState<{ rowId: string; field: keyof OrderRow } | null>(null);
   const [editValue, setEditValue] = useState('');
   const [galleryOpen, setGalleryOpen] = useState(false);
@@ -41,9 +49,14 @@ export default function OrderManagement() {
   const [filterDateFrom, setFilterDateFrom] = useState('');
   const [filterDateTo, setFilterDateTo] = useState('');
 
+  // Sort state
+  const [sortBy, setSortBy] = useState<'date' | 'value' | 'consignee' | 'packageNumber' | 'none'>('none');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
+
   useEffect(() => {
     loadOrders();
   }, [currentUser]);
+
 
   // Keyboard navigation for gallery
   useEffect(() => {
@@ -72,9 +85,15 @@ export default function OrderManagement() {
 
     try {
       setLoading(true);
+      console.log('🔍 OrderManagement - Loading orders...');
+      console.log('Organization ID:', currentUser.organizationId);
+      console.log('Collection path:', `organizations/${currentUser.organizationId}/orders`);
+
       const ordersRef = collection(db, 'organizations', currentUser.organizationId, 'orders');
       const q = query(ordersRef, orderBy('createdAt', 'asc'));
       const snapshot = await getDocs(q);
+
+      console.log('✅ Orders loaded:', snapshot.size);
 
       const loadedOrders: OrderRow[] = snapshot.docs.map(doc => ({
         id: doc.id,
@@ -82,6 +101,7 @@ export default function OrderManagement() {
         createdAt: doc.data().createdAt?.toDate() || new Date(),
       } as OrderRow));
 
+      console.log('📦 Orders:', loadedOrders);
       setOrders(loadedOrders);
     } catch (error) {
       console.error('Error loading orders:', error);
@@ -162,24 +182,11 @@ export default function OrderManagement() {
   };
 
   const handleSelectAll = () => {
-    // Filter orders based on current filters
-    const filtered = orders.filter(order => {
-      if (filterConsignee && !order.consignee.toLowerCase().includes(filterConsignee.toLowerCase())) {
-        return false;
-      }
-      if (filterDateFrom && order.date < filterDateFrom) {
-        return false;
-      }
-      if (filterDateTo && order.date > filterDateTo) {
-        return false;
-      }
-      return true;
-    });
-
-    if (selectedRows.size === filtered.length && filtered.length > 0) {
+    // Use sortedOrders which already has filters applied
+    if (selectedRows.size === sortedOrders.length && sortedOrders.length > 0) {
       setSelectedRows(new Set());
     } else {
-      setSelectedRows(new Set(filtered.map(o => o.id)));
+      setSelectedRows(new Set(sortedOrders.map(o => o.id)));
     }
   };
 
@@ -204,7 +211,7 @@ export default function OrderManagement() {
     }
   };
 
-  const handleExportSelected = async () => {
+  const handleMachoteExport = async (createNew: boolean) => {
     if (selectedRows.size === 0) {
       alert('Please select rows to export');
       return;
@@ -218,7 +225,14 @@ export default function OrderManagement() {
     const selectedOrders = orders.filter(order => selectedRows.has(order.id));
 
     setExporting(true);
+    setShowMachoteModal(false);
+
     try {
+      // If user chose to create new, clear the active doc ID first
+      if (createNew) {
+        await startNewGoogleDoc(currentUser.organizationId);
+      }
+
       // Show loading message
       const exportingMessage = `Exporting ${selectedRows.size} order${selectedRows.size !== 1 ? 's' : ''} to Google Docs...`;
       console.log(exportingMessage);
@@ -233,8 +247,11 @@ export default function OrderManagement() {
       if (result.success && result.docUrl) {
         // Success - open the doc
         window.open(result.docUrl, '_blank');
-        const action = result.isNew ? 'Created new document' : 'Appended to existing document';
+        const action = createNew ? 'Created new Machote' : (result.isNew ? 'Created new Machote' : 'Added to existing Machote');
         alert(`✅ Successfully exported ${selectedRows.size} order${selectedRows.size !== 1 ? 's' : ''}!\n\n${action}\n\nOpening Google Doc...`);
+
+        // Clear selections after successful export
+        setSelectedRows(new Set());
       } else {
         // Error
         alert(`❌ Export failed: ${result.error || 'Unknown error'}`);
@@ -247,21 +264,84 @@ export default function OrderManagement() {
     }
   };
 
-  const handleStartNewDoc = async () => {
+
+  const handleExportToSheets = async () => {
+    if (selectedRows.size === 0) {
+      alert('Please select orders to export');
+      return;
+    }
+
+    const selectedOrders = orders.filter(order => selectedRows.has(order.id));
+
+    // Check if orders have items
+    const ordersWithoutItems = selectedOrders.filter(o => !o.items || o.items.length === 0);
+    if (ordersWithoutItems.length > 0) {
+      const proceed = confirm(
+        `⚠️ ${ordersWithoutItems.length} order(s) have no line-item details.\n\n` +
+        `They will be exported as single rows with totals only.\n\n` +
+        `Continue export?`
+      );
+      if (!proceed) return;
+    }
+
+    setExportingSheets(true);
+    try {
+      const result = await exportOrdersToExcel(selectedOrders);
+
+      if (result.success) {
+        // Count total items exported
+        const totalItems = selectedOrders.reduce((sum, o) =>
+          sum + (o.items?.length || 1), 0
+        );
+
+        // Clear selections after successful export
+        setSelectedRows(new Set());
+
+        alert(
+          `✅ Successfully exported ${selectedOrders.length} order(s) with ${totalItems} line items!\n\n` +
+          `Customs Excel form downloaded with exact template formatting.\n` +
+          `Ready for customs submission.`
+        );
+      } else {
+        alert(`❌ Export failed: ${result.error || 'Unknown error'}`);
+      }
+    } catch (error) {
+      console.error('Customs export error:', error);
+      alert(`❌ Export failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setExportingSheets(false);
+    }
+  };
+
+  const handleStartNewSheet = async () => {
     if (!currentUser?.organizationId) {
       alert('❌ Organization not configured');
       return;
     }
 
-    const confirmed = confirm('Start a New Doc?\n\nThe next export will create a fresh Google document instead of adding to the existing one.');
+    const confirmed = confirm(
+      'Start New Customs Sheet?\n\n' +
+      'This will disconnect the current customs sheet.\n\n' +
+      'You will need to:\n' +
+      '1. Duplicate the customs template\n' +
+      '2. Update the sheet ID in Settings\n\n' +
+      'Continue?'
+    );
     if (!confirmed) return;
 
     try {
-      await startNewGoogleDoc(currentUser.organizationId);
-      alert('✅ New document will be created on next export');
+      await startNewGoogleSheet(currentUser.organizationId);
+      alert(
+        '✅ Customs sheet disconnected!\n\n' +
+        'To set up a new customs sheet:\n\n' +
+        '1. Go to: https://docs.google.com/spreadsheets/d/1WTHICIYqU4QiYXnVrgc2RrVxuhIDYmxtdy81d5g2mDA/edit\n' +
+        '2. Click File → Make a copy\n' +
+        '3. Copy the sheet ID from the URL\n' +
+        '4. Go to Settings and paste it as "Customs Sheet ID"'
+      );
     } catch (error) {
-      console.error('Error starting new doc:', error);
-      alert(`❌ Failed to start new document: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      console.error('Error starting new sheet:', error);
+      alert(`❌ Failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
 
@@ -269,8 +349,8 @@ export default function OrderManagement() {
     const isEditing = editingCell?.rowId === order.id && editingCell?.field === field;
     const value = order[field];
 
-    // Skip id, createdAt, screenshotUrls, orderNumber, carriers (these aren't directly displayed in table)
-    if (field === 'id' || field === 'createdAt' || field === 'screenshotUrls' || field === 'orderNumber' || field === 'carriers') return null;
+    // Skip id, createdAt, screenshotUrls, orderNumber, carriers, items (these aren't directly displayed in table)
+    if (field === 'id' || field === 'createdAt' || field === 'screenshotUrls' || field === 'orderNumber' || field === 'carriers' || field === 'items') return null;
 
     // Special handling for Date Delivered input
     if (field === 'dateDelivered') {
@@ -386,7 +466,7 @@ export default function OrderManagement() {
     );
   }
 
-  // Apply filters
+  // Apply filters and sorting
   const filteredOrders = orders.filter(order => {
     // Filter by consignee
     if (filterConsignee && !order.consignee.toLowerCase().includes(filterConsignee.toLowerCase())) {
@@ -402,6 +482,30 @@ export default function OrderManagement() {
     }
 
     return true;
+  });
+
+  // Apply sorting
+  const sortedOrders = [...filteredOrders].sort((a, b) => {
+    let comparison = 0;
+
+    switch (sortBy) {
+      case 'date':
+        comparison = new Date(a.date).getTime() - new Date(b.date).getTime();
+        break;
+      case 'value':
+        comparison = (a.value || 0) - (b.value || 0);
+        break;
+      case 'consignee':
+        comparison = (a.consignee || '').localeCompare(b.consignee || '');
+        break;
+      case 'packageNumber':
+        comparison = (a.packageNumber || '').localeCompare(b.packageNumber || '');
+        break;
+      default:
+        return 0;
+    }
+
+    return sortOrder === 'asc' ? comparison : -comparison;
   });
 
   // Get unique consignees for dropdown
@@ -424,57 +528,111 @@ export default function OrderManagement() {
         </p>
       </div>
 
-      {/* Filters */}
+      {/* Filters and Sorting */}
       <div className="bg-slate-800 border border-slate-700 rounded-lg p-4">
-        <div className="flex flex-col sm:flex-row gap-4">
-          <div className="flex-1">
-            <label className="block text-sm font-medium text-slate-300 mb-2">Filter by Consignee</label>
-            <select
-              value={filterConsignee}
-              onChange={(e) => setFilterConsignee(e.target.value)}
-              className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-            >
-              <option value="">All Consignees</option>
-              {uniqueConsignees.map(name => (
-                <option key={name} value={name}>{name}</option>
-              ))}
-            </select>
-          </div>
-          <div className="flex-1">
-            <label className="block text-sm font-medium text-slate-300 mb-2">Date From</label>
-            <input
-              type="date"
-              value={filterDateFrom}
-              onChange={(e) => setFilterDateFrom(e.target.value)}
-              className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-            />
-          </div>
-          <div className="flex-1">
-            <label className="block text-sm font-medium text-slate-300 mb-2">Date To</label>
-            <input
-              type="date"
-              value={filterDateTo}
-              onChange={(e) => setFilterDateTo(e.target.value)}
-              className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-            />
-          </div>
-          {(filterConsignee || filterDateFrom || filterDateTo) && (
-            <div className="flex items-end">
-              <button
-                onClick={() => {
-                  setFilterConsignee('');
-                  setFilterDateFrom('');
-                  setFilterDateTo('');
-                }}
-                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors text-sm whitespace-nowrap"
+        <h3 className="text-lg font-semibold text-white mb-3">Filters & Sorting</h3>
+        <div className="flex flex-col gap-4">
+          {/* Filter Row */}
+          <div className="flex flex-col sm:flex-row gap-4">
+            <div className="flex-1">
+              <label className="block text-sm font-medium text-slate-300 mb-2">Filter by Consignee</label>
+              <select
+                value={filterConsignee}
+                onChange={(e) => setFilterConsignee(e.target.value)}
+                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
               >
-                Clear Filters
-              </button>
+                <option value="">All Consignees</option>
+                {uniqueConsignees.map(name => (
+                  <option key={name} value={name}>{name}</option>
+                ))}
+              </select>
             </div>
-          )}
-        </div>
-        <div className="mt-2 text-sm text-slate-400">
-          Showing {filteredOrders.length} of {orders.length} orders
+            <div className="flex-1">
+              <label className="block text-sm font-medium text-slate-300 mb-2">Date From</label>
+              <input
+                type="date"
+                value={filterDateFrom}
+                onChange={(e) => setFilterDateFrom(e.target.value)}
+                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
+              />
+            </div>
+            <div className="flex-1">
+              <label className="block text-sm font-medium text-slate-300 mb-2">Date To</label>
+              <input
+                type="date"
+                value={filterDateTo}
+                onChange={(e) => setFilterDateTo(e.target.value)}
+                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
+              />
+            </div>
+          </div>
+
+          {/* Sort Row */}
+          <div className="flex flex-col sm:flex-row gap-4 border-t border-slate-700 pt-4">
+            <div className="flex-1">
+              <label className="block text-sm font-medium text-slate-300 mb-2">Sort By</label>
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as any)}
+                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
+              >
+                <option value="none">No Sorting</option>
+                <option value="date">Date</option>
+                <option value="value">Value</option>
+                <option value="consignee">Consignee Name</option>
+                <option value="packageNumber">Package Number</option>
+              </select>
+            </div>
+            <div className="flex-1">
+              <label className="block text-sm font-medium text-slate-300 mb-2">Sort Order</label>
+              <select
+                value={sortOrder}
+                onChange={(e) => setSortOrder(e.target.value as 'asc' | 'desc')}
+                disabled={sortBy === 'none'}
+                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <option value="asc">
+                  {sortBy === 'date' ? 'Oldest to Newest' :
+                   sortBy === 'value' ? 'Low to High' :
+                   sortBy === 'consignee' ? 'A to Z' :
+                   sortBy === 'packageNumber' ? 'A to Z' :
+                   'Ascending'}
+                </option>
+                <option value="desc">
+                  {sortBy === 'date' ? 'Newest to Oldest' :
+                   sortBy === 'value' ? 'High to Low' :
+                   sortBy === 'consignee' ? 'Z to A' :
+                   sortBy === 'packageNumber' ? 'Z to A' :
+                   'Descending'}
+                </option>
+              </select>
+            </div>
+            {(filterConsignee || filterDateFrom || filterDateTo || sortBy !== 'none') && (
+              <div className="flex items-end">
+                <button
+                  onClick={() => {
+                    setFilterConsignee('');
+                    setFilterDateFrom('');
+                    setFilterDateTo('');
+                    setSortBy('none');
+                    setSortOrder('asc');
+                  }}
+                  className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors text-sm whitespace-nowrap"
+                >
+                  Clear All
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div className="text-sm text-slate-400">
+            Showing {sortedOrders.length} of {orders.length} orders
+            {sortBy !== 'none' && ` • Sorted by ${sortBy === 'consignee' ? 'name' : sortBy} (${
+              sortBy === 'date' ? (sortOrder === 'asc' ? 'oldest first' : 'newest first') :
+              sortBy === 'value' ? (sortOrder === 'asc' ? 'low to high' : 'high to low') :
+              (sortOrder === 'asc' ? 'A-Z' : 'Z-A')
+            })`}
+          </div>
         </div>
       </div>
 
@@ -493,13 +651,15 @@ export default function OrderManagement() {
       </div>
 
       {/* Export Progress Banner */}
-      {exporting && (
+      {(exporting || exportingSheets) && (
         <div className="bg-blue-600 border-2 border-blue-400 rounded-lg shadow-lg p-4 animate-pulse">
           <div className="flex items-center gap-4">
             <div className="w-6 h-6 border-3 border-white border-t-transparent rounded-full animate-spin"></div>
             <div className="flex-1">
-              <p className="text-white font-semibold text-lg">Exporting to Google Docs...</p>
-              <p className="text-blue-100 text-sm">Please wait while we format and upload your orders</p>
+              <p className="text-white font-semibold text-lg">
+                {exporting ? 'Exporting to Google Docs...' : 'Exporting to Excel (Customs Format)...'}
+              </p>
+              <p className="text-blue-100 text-sm">Please wait while we format your customs document</p>
             </div>
             <div className="flex gap-1">
               <div className="w-2 h-2 bg-white rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
@@ -521,10 +681,11 @@ export default function OrderManagement() {
           <div className="flex flex-wrap gap-2 w-full sm:w-auto">
             {selectedRows.size > 0 && (
               <>
+                {/* Machote Export Button */}
                 <button
-                  onClick={handleExportSelected}
-                  disabled={exporting}
-                  className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-green-600 hover:bg-green-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors flex items-center justify-center gap-2"
+                  onClick={() => setShowMachoteModal(true)}
+                  disabled={exporting || exportingSheets}
+                  className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors flex items-center justify-center gap-2"
                 >
                   {exporting ? (
                     <>
@@ -534,14 +695,35 @@ export default function OrderManagement() {
                     </>
                   ) : (
                     <>
-                      <span className="hidden sm:inline">📄 Existing Doc ({selectedRows.size})</span>
-                      <span className="sm:hidden">📄 Existing</span>
+                      <span className="hidden sm:inline">📄 Export Machote</span>
+                      <span className="sm:hidden">📄 Machote</span>
                     </>
                   )}
                 </button>
+
+                {/* Desarrollo Button - Shows confirmation dialog before download */}
+                <button
+                  onClick={() => setShowDesarrolloConfirm(true)}
+                  disabled={exportingSheets || exporting}
+                  className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-green-600 hover:bg-green-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors flex items-center justify-center gap-2 whitespace-nowrap"
+                >
+                  {exportingSheets ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                      <span className="hidden sm:inline">Exporting...</span>
+                      <span className="sm:hidden">Export</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="hidden sm:inline">📊 Download Desarrollo</span>
+                      <span className="sm:hidden">📊</span>
+                    </>
+                  )}
+                </button>
+
                 <button
                   onClick={handleDeleteSelected}
-                  disabled={exporting}
+                  disabled={exporting || exportingSheets}
                   className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-red-600 hover:bg-red-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors whitespace-nowrap"
                 >
                   <span className="hidden sm:inline">🗑️ Delete</span>
@@ -549,14 +731,6 @@ export default function OrderManagement() {
                 </button>
               </>
             )}
-            <button
-              onClick={handleStartNewDoc}
-              className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-colors whitespace-nowrap"
-              title="Start a fresh Google Doc on next export"
-            >
-              <span className="hidden sm:inline">📝 New Doc</span>
-              <span className="sm:hidden">📝 New</span>
-            </button>
             <button
               onClick={loadOrders}
               className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors whitespace-nowrap"
@@ -569,14 +743,14 @@ export default function OrderManagement() {
 
       {/* Table */}
       <div className="bg-slate-800 rounded-lg shadow-lg border border-slate-700 overflow-hidden">
-        <div className="overflow-x-auto">
+        <div className="overflow-x-auto max-h-[calc(100vh-300px)] overflow-y-auto">
           <table className="w-full">
-            <thead className="bg-slate-700">
+            <thead className="bg-slate-700 sticky top-0 z-10">
               <tr>
                 <th className="px-2 sm:px-4 py-2 sm:py-3 text-left">
                   <input
                     type="checkbox"
-                    checked={selectedRows.size === filteredOrders.length && filteredOrders.length > 0}
+                    checked={selectedRows.size === sortedOrders.length && sortedOrders.length > 0}
                     onChange={handleSelectAll}
                     className="w-5 h-5 sm:w-4 sm:h-4 cursor-pointer"
                   />
@@ -598,14 +772,14 @@ export default function OrderManagement() {
               </tr>
             </thead>
             <tbody>
-              {filteredOrders.length === 0 ? (
+              {sortedOrders.length === 0 ? (
                 <tr>
                   <td colSpan={13} className="px-4 py-12 text-center text-slate-400">
                     No orders yet. Upload screenshots to automatically populate this table.
                   </td>
                 </tr>
               ) : (
-                filteredOrders.map((order, idx) => (
+                sortedOrders.map((order, idx) => (
                   <tr
                     key={order.id}
                     className={`border-t border-slate-700 transition-colors ${
@@ -727,6 +901,143 @@ export default function OrderManagement() {
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Machote Export Modal */}
+      {showMachoteModal && (
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={() => setShowMachoteModal(false)}>
+          <div className="bg-slate-800 rounded-lg shadow-2xl max-w-lg w-full border border-slate-600" onClick={(e) => e.stopPropagation()}>
+            {/* Header */}
+            <div className="p-6 border-b border-slate-700">
+              <h3 className="text-xl font-bold text-white">Export to Machote</h3>
+              <p className="text-slate-300 mt-2">Choose how you want to export your orders</p>
+            </div>
+
+            {/* Body */}
+            <div className="p-6 space-y-4">
+              {/* Option 1: Add to Existing */}
+              <label className="flex items-start gap-4 p-4 bg-slate-700/50 border-2 border-slate-600 rounded-lg cursor-pointer hover:bg-slate-700 transition-colors">
+                <input
+                  type="radio"
+                  name="machoteAction"
+                  value="append"
+                  checked={machoteAction === 'append'}
+                  onChange={(e) => setMachoteAction(e.target.value as 'append' | 'fresh')}
+                  className="mt-1 w-5 h-5 cursor-pointer"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-lg">📎</span>
+                    <h4 className="text-white font-semibold">Add to Current Machote</h4>
+                  </div>
+                  <p className="text-slate-300 text-sm">
+                    Append selected orders to your existing Google Doc. Orders will be added to the end of the document with a separator line.
+                  </p>
+                  <p className="text-blue-400 text-xs mt-2">
+                    ✓ Recommended for continuous order processing
+                  </p>
+                </div>
+              </label>
+
+              {/* Option 2: Start Fresh */}
+              <label className="flex items-start gap-4 p-4 bg-slate-700/50 border-2 border-slate-600 rounded-lg cursor-pointer hover:bg-slate-700 transition-colors">
+                <input
+                  type="radio"
+                  name="machoteAction"
+                  value="fresh"
+                  checked={machoteAction === 'fresh'}
+                  onChange={(e) => setMachoteAction(e.target.value as 'append' | 'fresh')}
+                  className="mt-1 w-5 h-5 cursor-pointer"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-lg">🆕</span>
+                    <h4 className="text-white font-semibold">Start Fresh Machote</h4>
+                  </div>
+                  <p className="text-slate-300 text-sm">
+                    Create a brand new Google Doc with today's date. This will start a new document from scratch.
+                  </p>
+                  <p className="text-yellow-400 text-xs mt-2">
+                    ⚠️ Previous document will remain unchanged
+                  </p>
+                </div>
+              </label>
+
+              <div className="bg-blue-900/20 border border-blue-800 rounded-lg p-3">
+                <p className="text-blue-300 text-sm">
+                  <span className="font-semibold">Tip:</span> Orders are always sorted alphabetically by customer name (A-Z) in the Machote.
+                </p>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="p-6 border-t border-slate-700 flex gap-3">
+              <button
+                onClick={() => setShowMachoteModal(false)}
+                className="flex-1 px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg font-medium transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleMachoteExport(machoteAction === 'fresh')}
+                className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors flex items-center justify-center gap-2"
+              >
+                {machoteAction === 'append' ? (
+                  <>
+                    <span>📎</span>
+                    <span>Add to Machote</span>
+                  </>
+                ) : (
+                  <>
+                    <span>🆕</span>
+                    <span>Start Fresh</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Desarrollo Confirmation Modal */}
+      {showDesarrolloConfirm && (
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={() => setShowDesarrolloConfirm(false)}>
+          <div className="bg-slate-800 rounded-lg shadow-2xl max-w-md w-full border border-slate-600" onClick={(e) => e.stopPropagation()}>
+            {/* Header */}
+            <div className="p-6 border-b border-slate-700">
+              <h3 className="text-xl font-bold text-white">Download Desarrollo</h3>
+              <p className="text-slate-300 mt-2">Do you need to make any changes?</p>
+            </div>
+
+            {/* Body */}
+            <div className="p-6">
+              <p className="text-slate-400 text-sm mb-6">
+                All selected information will be downloaded into a new Desarrollo Excel file.
+              </p>
+
+              {/* Action Buttons */}
+              <div className="flex flex-col gap-3">
+                <button
+                  onClick={() => {
+                    setShowDesarrolloConfirm(false);
+                    handleExportToSheets();
+                  }}
+                  className="w-full px-4 py-3 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
+                >
+                  <span>✓</span>
+                  <span>No, proceed to download</span>
+                </button>
+                <button
+                  onClick={() => setShowDesarrolloConfirm(false)}
+                  className="w-full px-4 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
+                >
+                  <span>✎</span>
+                  <span>Yes, add more information</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

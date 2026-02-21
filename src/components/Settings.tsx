@@ -77,8 +77,17 @@ export default function Settings() {
               const phone = whatsappPhoneData.replace('whatsapp:', '');
               const match = phone.match(/^(\+\d{1,3})(\d+)$/);
               if (match) {
-                setWhatsappCountryCode(match[1]);
-                setWhatsappPhone(match[2]);
+                const validCountryCodes = ['+1', '+503', '+52', '+504', '+505', '+506', '+507', '+591', '+593', '+502'];
+                const countryCode = match[1];
+                // Only set if it's a valid country code
+                if (validCountryCodes.includes(countryCode)) {
+                  setWhatsappCountryCode(countryCode);
+                  setWhatsappPhone(match[2]);
+                } else {
+                  // If invalid, default to +1 and show the full number
+                  setWhatsappCountryCode('+1');
+                  setWhatsappPhone(phone.replace('+', ''));
+                }
               }
             }
           }
@@ -144,8 +153,21 @@ export default function Settings() {
       return;
     }
 
-    // Remove any spaces, dashes, or parentheses
-    const cleanNumber = whatsappPhone.replace(/[\s\-\(\)]/g, '');
+    // Remove any spaces, dashes, parentheses, and plus signs
+    let cleanNumber = whatsappPhone.replace(/[\s\-\(\)\+]/g, '');
+
+    // Remove country code if user accidentally included it
+    // Check if number starts with the country code digits (without the +)
+    const countryCodeDigits = whatsappCountryCode.replace('+', '');
+    if (cleanNumber.startsWith(countryCodeDigits)) {
+      // Strip the country code from the beginning
+      cleanNumber = cleanNumber.substring(countryCodeDigits.length);
+    }
+
+    // For US numbers (+1), also strip leading "1" if present
+    if (whatsappCountryCode === '+1' && cleanNumber.startsWith('1') && cleanNumber.length === 11) {
+      cleanNumber = cleanNumber.substring(1);
+    }
 
     // Build full whatsapp phone format
     const whatsappPhoneFormatted = `whatsapp:${whatsappCountryCode}${cleanNumber}`;
@@ -160,9 +182,14 @@ export default function Settings() {
         updatedAt: serverTimestamp()
       });
 
+      // Format for display
+      const displayNumber = cleanNumber.length === 10
+        ? `${whatsappCountryCode} (${cleanNumber.slice(0, 3)}) ${cleanNumber.slice(3, 6)}-${cleanNumber.slice(6)}`
+        : `${whatsappCountryCode} ${cleanNumber}`;
+
       setWhatsappMessage({
         type: 'success',
-        text: `WhatsApp linked successfully! Send /help to ${whatsappCountryCode} ${cleanNumber} to test.`
+        text: `Phone number linked successfully! You can now send order screenshots from ${displayNumber} to +1 (415) 523-8886 via WhatsApp.`
       });
     } catch (error) {
       console.error('Error saving WhatsApp number:', error);
@@ -651,7 +678,7 @@ export default function Settings() {
             <div>
               <h3 className="text-lg font-semibold text-white mb-1">Google Drive Integration</h3>
               <p className="text-sm text-slate-400">
-                Connect your Google account to export orders to Google Docs
+                Connect your Google account to export orders to Google Docs and Customs Sheets
               </p>
             </div>
           </div>
@@ -833,17 +860,17 @@ export default function Settings() {
 
         <div className="bg-slate-700/50 border border-slate-600 rounded-lg p-4 mb-6">
           <p className="text-slate-300 text-sm mb-2">
-            Link your WhatsApp number to send order screenshots directly from your phone.
+            Link your phone number to send order screenshots directly from WhatsApp.
           </p>
           <p className="text-slate-400 text-xs">
-            After linking, send screenshots to <span className="font-mono text-blue-300">+1 (415) 523-8886</span> and they'll automatically appear in Order Management.
+            Enter your regular phone number (the one you use with WhatsApp). After linking, send screenshots to <span className="font-mono text-blue-300">+1 (415) 523-8886</span> and they'll automatically appear in Order Management.
           </p>
         </div>
 
         <div className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-slate-300 mb-2">
-              WhatsApp Phone Number
+              Your Phone Number
             </label>
             <div className="flex gap-2">
               <select
@@ -867,29 +894,32 @@ export default function Settings() {
                 type="tel"
                 value={whatsappPhone}
                 onChange={(e) => setWhatsappPhone(e.target.value)}
-                placeholder="4072896614"
+                placeholder={whatsappCountryCode === '+1' ? '4072896614' : '71234567'}
                 className="flex-1 max-w-md px-4 py-2 bg-slate-700 border border-slate-600 text-white rounded-lg focus:outline-none focus:border-blue-500"
               />
             </div>
             {whatsappPhone && (
               <p className="text-slate-300 text-sm mt-2">
-                Your WhatsApp: {whatsappCountryCode} {whatsappPhone}
+                Your number: {whatsappCountryCode} {whatsappPhone}
               </p>
             )}
             <p className="text-slate-400 text-xs mt-1">
-              Enter your WhatsApp number without spaces or dashes
+              Enter your phone number WITHOUT the country code (e.g., for +1-407-289-6614, enter 4072896614)
             </p>
           </div>
 
           <div className="bg-blue-900/20 border border-blue-800 rounded-lg p-4">
-            <h4 className="text-blue-300 font-medium mb-2">📋 How to Use:</h4>
-            <ol className="text-slate-300 text-sm space-y-1 list-decimal list-inside">
-              <li>Enter your phone number above</li>
-              <li>Click "Link WhatsApp Number"</li>
-              <li>Open WhatsApp and message: <span className="font-mono text-blue-300">+1 (415) 523-8886</span></li>
-              <li>Send: <span className="font-mono text-blue-300">/help</span> to see instructions</li>
-              <li>Send customer name + screenshots to create orders</li>
+            <h4 className="text-blue-300 font-medium mb-2">📋 How it Works:</h4>
+            <ol className="text-slate-300 text-sm space-y-1.5 list-decimal list-inside">
+              <li>Enter your regular phone number above (e.g., 4072896614)</li>
+              <li>Click "Link Phone Number" below</li>
+              <li>Open WhatsApp and message <span className="font-mono text-blue-300">+1 (415) 523-8886</span></li>
+              <li>Type <span className="font-mono bg-slate-700 px-1.5 py-0.5 rounded text-green-400">/help</span> for instructions</li>
+              <li>Send customer name + screenshot to create orders!</li>
             </ol>
+            <p className="text-slate-400 text-xs mt-3">
+              💡 Type <span className="font-mono">/help</span> in WhatsApp anytime for step-by-step guidance
+            </p>
           </div>
 
           {whatsappMessage && (
@@ -909,7 +939,7 @@ export default function Settings() {
             disabled={whatsappSaving || !whatsappPhone}
             className="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg font-medium"
           >
-            {whatsappSaving ? 'Saving...' : 'Link WhatsApp Number'}
+            {whatsappSaving ? 'Saving...' : 'Link Phone Number'}
           </button>
         </div>
       </div>

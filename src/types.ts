@@ -37,11 +37,20 @@ export interface Organization {
   googleDriveFolderId?: string; // Auto-created ImportFlow folder ID
   googleSheetId?: string; // Main tracking sheet ID
   activeGoogleDocId?: string; // Current active Google Doc for appending exports
+  activeGoogleSheetId?: string; // Current active customs Google Sheet for appending exports
 
   status: 'active' | 'suspended' | 'deleted';
   createdAt: Date;
   updatedAt: Date;
   metadata?: Record<string, any>;
+
+  // Usage Tracking (for billing)
+  aiExtractionsCount?: number; // Total number of AI extractions (screenshots analyzed)
+  totalAICost?: number; // Total estimated cost in USD
+  lastExtractionAt?: Date; // Timestamp of last AI extraction
+  currentMonthExtractions?: number; // Extractions in current billing month
+  currentMonthCost?: number; // Cost for current billing month
+  usageResetAt?: Date; // When current month usage was last reset
 }
 
 // User (for authentication and access control)

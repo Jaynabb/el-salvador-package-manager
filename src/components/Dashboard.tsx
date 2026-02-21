@@ -149,11 +149,11 @@ const Dashboard: React.FC = () => {
                     <div className="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-4 gap-2 sm:gap-3 text-xs sm:text-sm">
                       <div>
                         <span className="text-slate-500">Value:</span>{' '}
-                        <span className="text-green-400 font-medium">${order.value.toFixed(2)}</span>
+                        <span className="text-green-400 font-medium">${(order.value || 0).toFixed(2)}</span>
                       </div>
                       <div>
                         <span className="text-slate-500">Pieces:</span>{' '}
-                        <span className="text-white">{order.pieces}</span>
+                        <span className="text-white">{order.pieces || 0}</span>
                       </div>
                       <div>
                         <span className="text-slate-500">Company:</span>{' '}
