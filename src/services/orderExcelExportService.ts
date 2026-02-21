@@ -283,26 +283,61 @@ export const exportOrdersToExcel = async (
       }
     }
 
-    // STEP 3: Write our data starting at row 9, creating new formatted rows as needed
+    // STEP 3: Write data with automatic 68-row pagination
+    // Each "page" is 68 rows: First page has header (rows 1-8) + data (rows 9-67) + signature (row 68)
+    // Subsequent pages: data + signature at row 136, 204, 272, etc.
     const dataStartRow = 9;
+    const ROWS_PER_PAGE = 68;
+    const FIRST_PAGE_DATA_ROWS = 59; // Rows 9-67 (row 68 is signature)
+    const SUBSEQUENT_PAGE_DATA_ROWS = 67; // 68 rows minus 1 for signature
+
     let currentRowNumber = dataStartRow;
+    let dataRowsWritten = 0;
+    let isFirstPage = true;
 
-    for (const rowData of dataRows) {
+    // Helper function to add signature row
+    const addSignatureRow = (rowNum: number) => {
+      console.log(`📝 Adding signature at row ${rowNum}`);
+      const sigRow = worksheet.getRow(rowNum);
+      sigRow.height = savedSigLabelHeight;
+
+      for (let col = 1; col <= 10; col++) {
+        const cell = sigRow.getCell(col);
+        const savedStyle = savedSigLabelStyles[col];
+        if (savedStyle) {
+          if (savedStyle.style) cell.style = { ...savedStyle.style };
+          if (savedStyle.border) cell.border = { ...savedStyle.border };
+          if (savedStyle.fill) cell.fill = { ...savedStyle.fill };
+          if (savedStyle.font) cell.font = { ...savedStyle.font };
+          if (savedStyle.alignment) cell.alignment = { ...savedStyle.alignment };
+          if (savedStyle.numFmt) cell.numFmt = savedStyle.numFmt;
+          if (savedStyle.value) cell.value = savedStyle.value;
+        }
+      }
+    };
+
+    for (let i = 0; i < dataRows.length; i++) {
+      const rowData = dataRows[i];
+
+      // Check if we need to add signature before this row
+      const dataRowsThisPage = isFirstPage ? FIRST_PAGE_DATA_ROWS : SUBSEQUENT_PAGE_DATA_ROWS;
+
+      if (dataRowsWritten > 0 && dataRowsWritten % dataRowsThisPage === 0) {
+        // Add signature at current row
+        addSignatureRow(currentRowNumber);
+        currentRowNumber++;
+        isFirstPage = false; // After first signature, we're on subsequent pages
+      }
+
+      // Write data row
       const row = worksheet.getRow(currentRowNumber);
-
-      // Set row height to match template
       row.height = templateRowHeight;
 
-      // Detect per-customer total row (quantity in D, empty B/C/E, total in I)
+      // Detect per-customer total row
       const isPerCustomerTotal =
-        !rowData[1] && // B: Consignatario empty
-        !rowData[2] && // C: No de PK empty
-        rowData[3] &&  // D: Quantity has value
-        !rowData[4] && // E: Description empty (no "SUBTOTAL" text)
-        rowData[8];     // I: Total has value
+        !rowData[1] && !rowData[2] && rowData[3] && !rowData[4] && rowData[8];
 
-      // Apply template formatting to ALL data rows (not just beyond row 64)
-      // This is needed because we cleared the formatting when we cleared the data
+      // Apply template formatting
       for (let col = 1; col <= 10; col++) {
         const cell = row.getCell(col);
         const template = templateStyles[col];
@@ -315,13 +350,12 @@ export const exportOrdersToExcel = async (
           if (template.numFmt) cell.numFmt = template.numFmt;
         }
 
-        // Make quantity bold in per-customer total rows
-        if (isPerCustomerTotal && col === 4) { // Column D (quantity)
+        if (isPerCustomerTotal && col === 4) {
           cell.font = { ...cell.font, bold: true };
         }
       }
 
-      // Set values for each column (B through K, which is columns 2-11)
+      // Set values
       rowData.forEach((value, index) => {
         if (index > 0 && value !== undefined && value !== '') {
           const cell = row.getCell(index + 1);
@@ -331,164 +365,43 @@ export const exportOrdersToExcel = async (
       });
 
       currentRowNumber++;
+      dataRowsWritten++;
     }
 
-    const lastDataRow = currentRowNumber - 1;
-    console.log(`Wrote ${dataRows.length} rows (row ${dataStartRow} to ${lastDataRow})`);
+    console.log(`Wrote ${dataRows.length} data rows with automatic pagination`);
 
-    // Add a blank row with formatting after last data (matches template row 64)
-    const blankRowNum = lastDataRow + 1;
-    const blankRow = worksheet.getRow(blankRowNum);
-    blankRow.height = templateRowHeight; // Same height as data rows
-    for (let col = 1; col <= 10; col++) {
-      const cell = blankRow.getCell(col);
-      const template = templateStyles[col];
-      if (template) {
-        if (template.style) cell.style = { ...template.style };
-        if (template.border) cell.border = { ...template.border };
-        if (template.fill) cell.fill = { ...template.fill };
-        if (template.font) cell.font = { ...template.font };
-        if (template.alignment) cell.alignment = { ...template.alignment };
-      }
-      cell.value = null;
-    }
+    // Add final signature at row 68, or next multiple of 68
+    const nextSignatureRow = Math.ceil(currentRowNumber / ROWS_PER_PAGE) * ROWS_PER_PAGE;
+    addSignatureRow(nextSignatureRow);
+    console.log(`📝 Added final signature at row ${nextSignatureRow}`);
 
-    // STEP 4: Place SUBTOTAL row at correct position (1 row after blank row)
-    const subtotalRowNum = blankRowNum + 1;
-    console.log(`Placing SUBTOTAL at row ${subtotalRowNum}`);
-
-    // Apply saved SUBTOTAL formatting to new position
-    const subtotalRow = worksheet.getRow(subtotalRowNum);
-    subtotalRow.height = savedSubtotalHeight;
-
-    // Apply all saved cell styles and values
-    for (let col = 1; col <= 10; col++) {
-      const savedStyle = savedSubtotalStyles[col];
-      const targetCell = subtotalRow.getCell(col);
-
-      // Apply saved style
-      if (savedStyle) {
-        if (savedStyle.style) targetCell.style = { ...savedStyle.style };
-        if (savedStyle.border) targetCell.border = { ...savedStyle.border };
-        if (savedStyle.fill) targetCell.fill = { ...savedStyle.fill };
-        if (savedStyle.font) targetCell.font = { ...savedStyle.font };
-        if (savedStyle.alignment) targetCell.alignment = { ...savedStyle.alignment };
-        if (savedStyle.numFmt) targetCell.numFmt = savedStyle.numFmt;
-
-        // Copy value (except for column I which gets our grand total)
-        if (col === 9) {
-          targetCell.value = grandTotal; // Column I - our calculated total (was J before removing Categoria)
-        } else if (savedStyle.value) {
-          targetCell.value = savedStyle.value;
-        }
-      }
-    }
-
-    // Note: Template rows 65-70 were already cleared in STEP 2 (before writing data)
-    // This prevents accidentally deleting data rows that extend into rows 65-70
-
-    // Add 2 blank rows after SUBTOTAL (matches template rows 66-67)
-    const blankAfterSubtotal1 = worksheet.getRow(subtotalRowNum + 1);
-    blankAfterSubtotal1.height = savedBlankRow66Height;
-    for (let col = 1; col <= 10; col++) {
-      blankAfterSubtotal1.getCell(col).value = null;
-    }
-
-    const blankAfterSubtotal2 = worksheet.getRow(subtotalRowNum + 2);
-    blankAfterSubtotal2.height = savedBlankRow67Height;
-    for (let col = 1; col <= 10; col++) {
-      blankAfterSubtotal2.getCell(col).value = null;
-    }
-
-    // STEP 5: Place signature area at FIXED POSITION at bottom of page (page footer)
-    // Keep signature at original template position (rows 68-69) so it stays at bottom of page
-    const signatureLineRowNum = 68; // Row with signature lines (FIXED - page footer)
-    const signatureLabelRowNum = 69; // Row with "Nombre" and "Firma" labels (FIXED - page footer)
-    console.log(`📝 Signature placement: FIXED at bottom of page (rows ${signatureLineRowNum}-${signatureLabelRowNum}) - not moving with data`);
-
-    // Apply saved signature line row formatting
-    const newSigLineRow = worksheet.getRow(signatureLineRowNum);
-    newSigLineRow.height = savedSigLineHeight;
-
-    for (let col = 1; col <= 10; col++) {
-      const savedStyle = savedSigLineStyles[col];
-      const targetCell = newSigLineRow.getCell(col);
-
-      if (savedStyle) {
-        if (savedStyle.style) targetCell.style = { ...savedStyle.style };
-        if (savedStyle.border) targetCell.border = { ...savedStyle.border };
-        if (savedStyle.fill) targetCell.fill = { ...savedStyle.fill };
-        if (savedStyle.font) targetCell.font = { ...savedStyle.font };
-        if (savedStyle.alignment) targetCell.alignment = { ...savedStyle.alignment };
-        if (savedStyle.numFmt) targetCell.numFmt = savedStyle.numFmt;
-        if (savedStyle.value) targetCell.value = savedStyle.value;
-      }
-    }
-
-    // Apply saved signature label row formatting
-    const newSigLabelRow = worksheet.getRow(signatureLabelRowNum);
-    newSigLabelRow.height = savedSigLabelHeight;
-
-    for (let col = 1; col <= 10; col++) {
-      const savedStyle = savedSigLabelStyles[col];
-      const targetCell = newSigLabelRow.getCell(col);
-
-      if (savedStyle) {
-        if (savedStyle.style) targetCell.style = { ...savedStyle.style };
-        if (savedStyle.border) targetCell.border = { ...savedStyle.border };
-        if (savedStyle.fill) targetCell.fill = { ...savedStyle.fill };
-        if (savedStyle.font) targetCell.font = { ...savedStyle.font };
-        if (savedStyle.alignment) targetCell.alignment = { ...savedStyle.alignment };
-        if (savedStyle.numFmt) targetCell.numFmt = savedStyle.numFmt;
-        if (savedStyle.value) targetCell.value = savedStyle.value;
-      }
-    }
-
-    // Note: Original signature rows (68-69) were already cleared above with rows 65-70
-
-    // CRITICAL: Re-apply merged cells from template, adjusting row numbers for SUBTOTAL/signature
-    console.log(`Restoring ${savedMerges.length} merged cells from template...`);
+    // CRITICAL: Re-apply merged cells from template for header area only
+    // Signature rows are now dynamically placed, so we don't merge those from template
+    console.log(`Restoring header merged cells from template...`);
     console.log('Saved merges:', savedMerges);
 
     const adjustedMerges: string[] = [];
-    const rowOffset = subtotalRowNum - 65; // How many rows we shifted SUBTOTAL
 
     for (const mergeRange of savedMerges) {
       try {
-        // Parse the merge range (e.g., "B7:B8" -> from B7 to B8)
         const [start, end] = mergeRange.split(':');
-
-        // Extract row numbers from the merge range
         const startRow = parseInt(start.match(/\d+/)?.[0] || '0');
         const endRow = parseInt(end.match(/\d+/)?.[0] || '0');
 
         let adjustedRange = mergeRange;
 
-        // If this merge is in SUBTOTAL row (65), shift it
-        if (startRow === 65 && endRow === 65) {
-          const newRow = subtotalRowNum;
-          adjustedRange = mergeRange.replace(/65/g, newRow.toString());
-          console.log(`  Adjusting SUBTOTAL merge: ${mergeRange} → ${adjustedRange}`);
-        }
-        // Signature area (68-69) stays FIXED at bottom of page - don't adjust
-        else if (startRow >= 68 && endRow <= 69) {
-          adjustedRange = mergeRange; // Keep original position (page footer)
-          console.log(`  Keeping signature merge at original position (page footer): ${mergeRange}`);
-        }
-        // Header merges (rows 1-8) and data area - keep as-is
-        else {
+        // Only preserve header merges (rows 1-8)
+        if (startRow <= 8 && endRow <= 8) {
           adjustedRange = mergeRange;
-        }
+          adjustedMerges.push(adjustedRange);
 
-        adjustedMerges.push(adjustedRange);
-
-        // Apply the merge
-        const startCell = worksheet.getCell(adjustedRange.split(':')[0]);
-        if (!startCell.isMerged) {
-          worksheet.mergeCells(adjustedRange);
-          console.log(`  ✓ Applied merge: ${adjustedRange}`);
+          const startCell = worksheet.getCell(adjustedRange.split(':')[0]);
+          if (!startCell.isMerged) {
+            worksheet.mergeCells(adjustedRange);
+            console.log(`  ✓ Applied header merge: ${adjustedRange}`);
+          }
         } else {
-          console.log(`  - Already merged: ${adjustedRange}`);
+          console.log(`  Skipping data/signature merge: ${mergeRange} (not needed with dynamic pagination)`);
         }
       } catch (error) {
         console.warn(`  ✗ Failed to merge ${mergeRange}:`, error);
@@ -496,7 +409,7 @@ export const exportOrdersToExcel = async (
     }
 
     worksheet.model.merges = adjustedMerges;
-    console.log(`Final merge count: ${adjustedMerges.length} (expected: ${savedMerges.length})`);
+    console.log(`Final merge count: ${adjustedMerges.length} (header only)`);
 
     // CRITICAL: Restore view settings (including showGridLines: false)
     if (savedViews && savedViews.length > 0) {
