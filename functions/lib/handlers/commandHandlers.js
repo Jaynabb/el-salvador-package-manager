@@ -59,34 +59,27 @@ async function handleHelpCommand(senderPhone, args) {
 
 *How to Add Orders:*
 
-1️⃣  Type the customer name
-     _Example: Maria Rodriguez_
+1️⃣  Send customer name
 
-2️⃣  Send their screenshots
-     (one or multiple images)
+2️⃣  Send order screenshot
 
-3️⃣  Done! Repeat for next customer
+3️⃣  Done! Order appears in your app
 
 ━━━━━━━━━━━━━━━━━━━━
 
-*Commands:*
+*What Happens:*
 
-/status - See pending orders
-/help - Show this message
-
-━━━━━━━━━━━━━━━━━━━━
-
-✨ *What Happens Automatically:*
-
-✅ Screenshots saved
-✅ Order details extracted
-✅ Added to "Pending Review"
-
-Then review in the ImportFlow app and assign to docs.
+✅  AI extracts order details
+✅  Sequential package number assigned
+✅  Order added to Order Management
 
 ━━━━━━━━━━━━━━━━━━━━
 
-Questions? Visit importflow-app.web.app`;
+💡 *Tip:* Send name and screenshot together for fastest processing
+
+━━━━━━━━━━━━━━━━━━━━
+
+Questions? importflow-app.web.app`;
     await (0, twilioService_1.sendWhatsAppMessage)(senderPhone, helpText);
 }
 // Export placeholder for /export command (removed from WhatsApp)
