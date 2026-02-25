@@ -78,7 +78,7 @@ const buildExcelRows = (orders: OrderRow[]): { dataRows: any[][], grandTotal: nu
       const difference = Math.abs(itemsTotal - orderTotal);
 
       // Track totals for this customer's subtotal row
-      let totalQuantity = 0;
+      let totalItemQuantity = 0;
       let finalTotalValue = itemsTotal; // Default to items sum
 
       // 🔴 IMPORTANT: Use order.value if it differs (includes discounts/taxes)
@@ -114,7 +114,18 @@ const buildExcelRows = (orders: OrderRow[]): { dataRows: any[][], grandTotal: nu
         ]);
 
         // Accumulate totals for subtotal row
-        totalQuantity += item.quantity || 0;
+        totalItemQuantity += item.quantity || 0;
+      }
+
+      // Use manually-edited pieces count if it differs from items sum (user corrected it)
+      const totalQuantity = (order.pieces && order.pieces !== totalItemQuantity)
+        ? order.pieces
+        : totalItemQuantity;
+
+      if (order.pieces && order.pieces !== totalItemQuantity) {
+        console.log(
+          `✓ Manual edit detected for ${order.packageNumber}: items sum=${totalItemQuantity}, order.pieces=${order.pieces} — using edited value`
+        );
       }
 
       // Add per-customer total row (no "SUBTOTAL" text - just bold quantity and total)
@@ -292,17 +303,35 @@ export const exportOrdersToExcel = async (
     const SUBSEQUENT_PAGE_DATA_ROWS = 67; // 68 rows minus 1 for signature
 
     let currentRowNumber = dataStartRow;
-    let dataRowsWritten = 0;
+    let dataRowsOnCurrentPage = 0; // Per-page counter (resets after each signature)
     let isFirstPage = true;
 
-    // Helper function to add signature row
-    const addSignatureRow = (rowNum: number) => {
-      console.log(`📝 Adding signature at row ${rowNum}`);
-      const sigRow = worksheet.getRow(rowNum);
-      sigRow.height = savedSigLabelHeight;
+    // Helper function to add signature rows (line + labels, like template rows 68-69)
+    const addSignatureRows = (startRowNum: number) => {
+      console.log(`Adding signature at rows ${startRowNum}-${startRowNum + 1}`);
 
+      // Signature line row (template row 68)
+      const sigLineRow = worksheet.getRow(startRowNum);
+      sigLineRow.height = savedSigLineHeight;
       for (let col = 1; col <= 10; col++) {
-        const cell = sigRow.getCell(col);
+        const cell = sigLineRow.getCell(col);
+        const savedStyle = savedSigLineStyles[col];
+        if (savedStyle) {
+          if (savedStyle.style) cell.style = { ...savedStyle.style };
+          if (savedStyle.border) cell.border = { ...savedStyle.border };
+          if (savedStyle.fill) cell.fill = { ...savedStyle.fill };
+          if (savedStyle.font) cell.font = { ...savedStyle.font };
+          if (savedStyle.alignment) cell.alignment = { ...savedStyle.alignment };
+          if (savedStyle.numFmt) cell.numFmt = savedStyle.numFmt;
+          if (savedStyle.value) cell.value = savedStyle.value;
+        }
+      }
+
+      // Signature label row (template row 69 - "Nombre" / "Firma")
+      const sigLabelRow = worksheet.getRow(startRowNum + 1);
+      sigLabelRow.height = savedSigLabelHeight;
+      for (let col = 1; col <= 10; col++) {
+        const cell = sigLabelRow.getCell(col);
         const savedStyle = savedSigLabelStyles[col];
         if (savedStyle) {
           if (savedStyle.style) cell.style = { ...savedStyle.style };
@@ -319,14 +348,41 @@ export const exportOrdersToExcel = async (
     for (let i = 0; i < dataRows.length; i++) {
       const rowData = dataRows[i];
 
-      // Check if we need to add signature before this row
-      const dataRowsThisPage = isFirstPage ? FIRST_PAGE_DATA_ROWS : SUBSEQUENT_PAGE_DATA_ROWS;
+      // Check if current page is full and we need a signature break
+      const maxRowsThisPage = isFirstPage ? FIRST_PAGE_DATA_ROWS : SUBSEQUENT_PAGE_DATA_ROWS;
 
-      if (dataRowsWritten > 0 && dataRowsWritten % dataRowsThisPage === 0) {
-        // Add signature at current row
-        addSignatureRow(currentRowNumber);
+      if (dataRowsOnCurrentPage >= maxRowsThisPage) {
+        // Add SUBTOTAL row at current position
+        const subtotalRow = worksheet.getRow(currentRowNumber);
+        subtotalRow.height = savedSubtotalHeight;
+        for (let col = 1; col <= 10; col++) {
+          const cell = subtotalRow.getCell(col);
+          const savedStyle = savedSubtotalStyles[col];
+          if (savedStyle) {
+            if (savedStyle.style) cell.style = { ...savedStyle.style };
+            if (savedStyle.border) cell.border = { ...savedStyle.border };
+            if (savedStyle.fill) cell.fill = { ...savedStyle.fill };
+            if (savedStyle.font) cell.font = { ...savedStyle.font };
+            if (savedStyle.alignment) cell.alignment = { ...savedStyle.alignment };
+            if (savedStyle.numFmt) cell.numFmt = savedStyle.numFmt;
+            if (savedStyle.value) cell.value = savedStyle.value;
+          }
+        }
         currentRowNumber++;
-        isFirstPage = false; // After first signature, we're on subsequent pages
+
+        // Add blank rows (66-67 equivalent) before signature
+        worksheet.getRow(currentRowNumber).height = savedBlankRow66Height;
+        currentRowNumber++;
+        worksheet.getRow(currentRowNumber).height = savedBlankRow67Height;
+        currentRowNumber++;
+
+        // Add signature rows
+        addSignatureRows(currentRowNumber);
+        currentRowNumber += 2; // Skip past both signature rows
+
+        // Reset per-page counter
+        dataRowsOnCurrentPage = 0;
+        isFirstPage = false;
       }
 
       // Write data row
@@ -365,15 +421,41 @@ export const exportOrdersToExcel = async (
       });
 
       currentRowNumber++;
-      dataRowsWritten++;
+      dataRowsOnCurrentPage++;
     }
 
     console.log(`Wrote ${dataRows.length} data rows with automatic pagination`);
 
-    // Add final signature at row 68, or next multiple of 68
-    const nextSignatureRow = Math.ceil(currentRowNumber / ROWS_PER_PAGE) * ROWS_PER_PAGE;
-    addSignatureRow(nextSignatureRow);
-    console.log(`📝 Added final signature at row ${nextSignatureRow}`);
+    // Add final SUBTOTAL + signature after all data
+    // SUBTOTAL row
+    const finalSubtotalRow = worksheet.getRow(currentRowNumber);
+    finalSubtotalRow.height = savedSubtotalHeight;
+    for (let col = 1; col <= 10; col++) {
+      const cell = finalSubtotalRow.getCell(col);
+      const savedStyle = savedSubtotalStyles[col];
+      if (savedStyle) {
+        if (savedStyle.style) cell.style = { ...savedStyle.style };
+        if (savedStyle.border) cell.border = { ...savedStyle.border };
+        if (savedStyle.fill) cell.fill = { ...savedStyle.fill };
+        if (savedStyle.font) cell.font = { ...savedStyle.font };
+        if (savedStyle.alignment) cell.alignment = { ...savedStyle.alignment };
+        if (savedStyle.numFmt) cell.numFmt = savedStyle.numFmt;
+        if (savedStyle.value) cell.value = savedStyle.value;
+      }
+    }
+    // Write grand total value into SUBTOTAL row column I
+    finalSubtotalRow.getCell(9).value = grandTotal;
+    currentRowNumber++;
+
+    // Blank rows before signature
+    worksheet.getRow(currentRowNumber).height = savedBlankRow66Height;
+    currentRowNumber++;
+    worksheet.getRow(currentRowNumber).height = savedBlankRow67Height;
+    currentRowNumber++;
+
+    // Final signature
+    addSignatureRows(currentRowNumber);
+    console.log(`Added final signature at rows ${currentRowNumber}-${currentRowNumber + 1}`);
 
     // CRITICAL: Re-apply merged cells from template for header area only
     // Signature rows are now dynamically placed, so we don't merge those from template
