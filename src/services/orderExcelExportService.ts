@@ -271,11 +271,11 @@ const fixXlsxDimension = async (buffer: ExcelJS.Buffer): Promise<ArrayBuffer> =>
   const xml = await zip.file(sheetPath)?.async('string');
   if (!xml) return buffer as ArrayBuffer;
 
-  // Replace dimension ref — ensure column C (min data column) is included
-  const fixed = xml.replace(
-    /<dimension ref="D(\d+):([A-Z]+\d+)"\/>/,
-    '<dimension ref="C$1:$2"/>',
-  );
+  // Remove the dimension tag entirely.
+  // ExcelJS miscalculates it (D1 instead of C1), and the tag also causes
+  // Apple Numbers to draw an unwanted table outline around the used range.
+  // Excel/Google Sheets recalculate the range from actual cell data on open.
+  const fixed = xml.replace(/<dimension ref="[^"]*"\/>\s*/, '');
 
   if (fixed !== xml) {
     zip.file(sheetPath, fixed);
@@ -478,20 +478,20 @@ export const exportOrdersToExcel = async (
       ws.getRow(currentRow).height = ROW_HEIGHT;
       currentRow++;
 
-      // Signature lines
+      // Signature lines (matching PDF: left under Consignatario, right under Valor Unit)
       ws.getRow(currentRow).height = ROW_HEIGHT;
-      ws.getCell(`D${currentRow}`).value = '__________________';
-      ws.getCell(`D${currentRow}`).font = { ...FONT };
+      ws.getCell(`C${currentRow}`).value = '__________________';
+      ws.getCell(`C${currentRow}`).font = { ...FONT };
       ws.getCell(`I${currentRow}`).value = '__________________';
       ws.getCell(`I${currentRow}`).font = { ...FONT };
       currentRow++;
 
       // Labels
       ws.getRow(currentRow).height = ROW_HEIGHT;
-      ws.getCell(`D${currentRow}`).value = 'Nombre';
-      ws.getCell(`D${currentRow}`).font = { ...FONT };
-      ws.getCell(`J${currentRow}`).value = 'Firma';
-      ws.getCell(`J${currentRow}`).font = { ...FONT };
+      ws.getCell(`C${currentRow}`).value = 'Nombre';
+      ws.getCell(`C${currentRow}`).font = { ...FONT };
+      ws.getCell(`I${currentRow}`).value = 'Firma';
+      ws.getCell(`I${currentRow}`).font = { ...FONT };
       currentRow++;
 
       // Blank row between pages (not after last page)
