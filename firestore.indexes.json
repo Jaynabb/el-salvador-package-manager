@@ -13,16 +13,6 @@
           "order": "DESCENDING"
         }
       ]
-    },
-    {
-      "collectionGroup": "exportHistory",
-      "queryScope": "COLLECTION",
-      "fields": [
-        {
-          "fieldPath": "exportedAt",
-          "order": "DESCENDING"
-        }
-      ]
     }
   ],
   "fieldOverrides": []

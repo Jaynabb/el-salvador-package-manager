@@ -26,6 +26,10 @@ dist-ssr
 .env
 functions/.env
 
+# Firebase service account keys
+serviceAccountKey.json
+*-firebase-adminsdk-*.json
+
 # Scripts with hardcoded secrets
 update-user-status.js
 update-user-status.mjs

@@ -1,519 +1,526 @@
 import ExcelJS from 'exceljs';
+import * as JSZip from 'jszip';
 import type { OrderRow } from '../components/OrderManagement';
 
 /**
- * Order Excel Export Service
- * Exports orders to Excel using the exact customs template format (1:1 copy)
- * Template: PLANTILLA DESARROLLO ABRIL 7 (1).xlsx
- * Preserves ALL formatting: colors, fonts, borders, merged cells, column widths, etc.
+ * Desarrollo Excel Export Service
+ * Builds the customs CONTROL sheet from scratch to match the Google Sheet reference format.
+ * Columns C-K, Calibri 13pt, full grid borders, formulas for TOTAL/SUBTOTAL/Grand TOTAL,
+ * pagination keeping whole customers together, page indicators, and signature blocks.
  */
 
-/**
- * Map company name to category
- */
-const categorizeCompany = (company: string): string => {
-  if (!company) return '';
+// ── Style constants ──────────────────────────────────────────────────────────
 
-  const lower = company.toLowerCase();
-  if (lower.includes('amazon')) return 'APARATOS ELÉCTRICOS DEL HOGAR';
-  if (lower.includes('shein')) return 'PRENDAS DE VESTIR Y ACCESORIOS PARA DAMA';
-  if (lower.includes('temu')) return 'OTROS_ARTICULOS_IMPORTADOS';
-  return '';
+const FONT: Partial<ExcelJS.Font> = { name: 'Calibri', size: 13, color: { argb: 'FF000000' } };
+const FONT_BOLD: Partial<ExcelJS.Font> = { ...FONT, bold: true };
+const CURRENCY_FORMAT = '"$"#,##0.00';
+
+// Border matching reference: thin black (argb FF000000)
+const TB: Partial<ExcelJS.Border> = { style: 'thin', color: { argb: 'FF000000' } };
+
+// Full grid border for all data cells C-K
+const CELL_BORDER: Partial<ExcelJS.Borders> = { left: TB, right: TB, top: TB, bottom: TB };
+
+const ROW_HEIGHT = 15.75;
+const MAX_DATA_ROWS_PER_PAGE = 60;
+
+const COLUMN_WIDTHS: Record<string, number> = {
+  A: 8.71, B: 2.14, C: 24.86, D: 14.43, E: 5, F: 54,
+  G: 8.86, H: 15.14, I: 12.14, J: 21.71, K: 8.71,
 };
 
-/**
- * Build Excel rows from orders - Data rows + per-customer subtotals (no ending SUBTOTAL/signature)
- * Template has grand SUBTOTAL fixed at row 65, signature at rows 68-69
- * Each customer gets their own subtotal row showing total quantity and order total
- * Returns: { dataRows, grandTotal }
- */
-const buildExcelRows = (orders: OrderRow[]): { dataRows: any[][], grandTotal: number } => {
-  const rows: any[][] = [];
-  let grandTotalValue = 0;
+// ── Data structures ──────────────────────────────────────────────────────────
 
-  // Add all customer data with per-customer subtotals (no ending grand SUBTOTAL/signature yet)
-  for (let orderIndex = 0; orderIndex < orders.length; orderIndex++) {
-    const order = orders[orderIndex];
+interface CustomerBlock {
+  consignee: string;
+  packageNumber: string;
+  items: { quantity: number; description: string; unitValue: number; totalValue: number }[];
+  totalQuantity: number;
+  totalValue: number;
+}
 
+// ── Helper: apply grid borders to columns C-K on a row ───────────────────────
+
+const applyGridBorders = (ws: ExcelJS.Worksheet, rowNum: number) => {
+  for (const col of ['C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K']) {
+    ws.getCell(`${col}${rowNum}`).border = { ...CELL_BORDER };
+  }
+};
+
+// ── Helper: apply SUBTOTAL row borders (H/J special pattern) ─────────────────
+
+const applySubtotalBorders = (ws: ExcelJS.Worksheet, rowNum: number) => {
+  // Only H, I, J get borders — C-G and K are empty/borderless (per PDF reference)
+  ws.getCell(`H${rowNum}`).border = { left: TB, top: TB, bottom: TB };
+  ws.getCell(`I${rowNum}`).border = { ...CELL_BORDER };
+  ws.getCell(`J${rowNum}`).border = { right: TB, top: TB, bottom: TB };
+};
+
+// ── Build customer blocks from orders ────────────────────────────────────────
+
+const buildCustomerBlocks = (orders: OrderRow[]): CustomerBlock[] => {
+  const sorted = [...orders].sort((a, b) => {
+    const nameA = (a.consignee || '').toLowerCase().trim();
+    const nameB = (b.consignee || '').toLowerCase().trim();
+    return nameA.localeCompare(nameB);
+  });
+
+  return sorted.map(order => {
     if (!order.items || order.items.length === 0) {
-      // No items - create single row with order-level data
-      const orderValue = order.value || 0;
-      const orderQuantity = order.pieces || 0;
-      grandTotalValue += orderValue;
-
-      console.log(`Building row for ${order.packageNumber} (no items) - Row ${rows.length + 1}`);
-      rows.push([
-        '', // Column A (empty)
-        order.consignee || '',                    // B: Consignatario
-        order.packageNumber || '',                // C: No de PK
-        orderQuantity,                            // D: Cant.
-        'No item details',                        // E: Descripcion
-        '',                                       // F: Usado (empty)
-        'X',                                      // G: Nuevo (X)
-        orderValue,                               // H: Valor Unit
-        orderValue,                               // I: Total
-        '',                                       // J: IVA (blank)
-      ]);
-
-      // Add per-customer total row (no "SUBTOTAL" text - just bold quantity and total)
-      rows.push([
-        '',                                       // Column A (empty)
-        '',                                       // B: Consignatario (blank)
-        '',                                       // C: No de PK (blank)
-        orderQuantity,                            // D: Total quantity (will be bolded)
-        '',                                       // E: Description (blank - no redundant SUBTOTAL text)
-        '',                                       // F: Usado (blank)
-        '',                                       // G: Nuevo (blank)
-        '',                                       // H: Valor Unit (blank)
-        orderValue,                               // I: Total value
-        '',                                       // J: IVA (blank)
-      ]);
-    } else {
-      // Has items - create one row per item
-      console.log(`Building rows for ${order.packageNumber} - ${order.items.length} items`);
-
-      // Calculate totals ONCE for this order
-      const itemsTotal = order.items.reduce((sum, item) => sum + (item.totalValue || 0), 0);
-      const orderTotal = order.value || 0;
-      const difference = Math.abs(itemsTotal - orderTotal);
-
-      // Track totals for this customer's subtotal row
-      let totalItemQuantity = 0;
-      let finalTotalValue = itemsTotal; // Default to items sum
-
-      // 🔴 IMPORTANT: Use order.value if it differs (includes discounts/taxes)
-      if (difference > 0.01) {
-        console.log(
-          `✓ Discount/Tax adjustment for ${order.packageNumber}:`,
-          `Items: $${itemsTotal.toFixed(2)}, Order: $${orderTotal.toFixed(2)}, Using: $${orderTotal.toFixed(2)}`
-        );
-        finalTotalValue = orderTotal; // Use order total with discounts
-        grandTotalValue += orderTotal;
-      } else {
-        grandTotalValue += itemsTotal; // Use items total
-      }
-
-      for (let itemIndex = 0; itemIndex < order.items.length; itemIndex++) {
-        const item = order.items[itemIndex];
-        const description = item.name + (item.description ? ' - ' + item.description : '');
-
-        // Only show customer name and package number on FIRST row
-        const isFirstRow = itemIndex === 0;
-
-        rows.push([
-          '',                                                      // Column A (empty)
-          isFirstRow ? (order.consignee || '').toUpperCase() : '', // B: Consignatario (only first row, uppercase)
-          isFirstRow ? (order.packageNumber || '') : '',           // C: No de PK (only first row)
-          item.quantity || 0,                                      // D: Cant.
-          description.toUpperCase(),                               // E: Descripcion (uppercase like template)
-          '',                                                      // F: Usado (empty)
-          'X',                                                     // G: Nuevo (X)
-          item.unitValue || 0,                                     // H: Valor Unit
-          item.totalValue || 0,                                    // I: Total
-          '',                                                      // J: IVA (blank for manual entry)
-        ]);
-
-        // Accumulate totals for subtotal row
-        totalItemQuantity += item.quantity || 0;
-      }
-
-      // Use manually-edited pieces count if it differs from items sum (user corrected it)
-      const totalQuantity = (order.pieces && order.pieces !== totalItemQuantity)
-        ? order.pieces
-        : totalItemQuantity;
-
-      if (order.pieces && order.pieces !== totalItemQuantity) {
-        console.log(
-          `✓ Manual edit detected for ${order.packageNumber}: items sum=${totalItemQuantity}, order.pieces=${order.pieces} — using edited value`
-        );
-      }
-
-      // Add per-customer total row (no "SUBTOTAL" text - just bold quantity and total)
-      rows.push([
-        '',                                       // Column A (empty)
-        '',                                       // B: Consignatario (blank)
-        '',                                       // C: No de PK (blank)
-        totalQuantity,                            // D: Total quantity (will be bolded)
-        '',                                       // E: Description (blank - no redundant SUBTOTAL text)
-        '',                                       // F: Usado (blank)
-        '',                                       // G: Nuevo (blank)
-        '',                                       // H: Valor Unit (blank)
-        finalTotalValue,                          // I: Total value (order total with discounts/taxes)
-        '',                                       // J: IVA (blank)
-      ]);
+      return {
+        consignee: (order.consignee || '').toUpperCase(),
+        packageNumber: order.packageNumber || '',
+        items: [{
+          quantity: order.pieces || 0,
+          description: 'NO ITEM DETAILS',
+          unitValue: order.value || 0,
+          totalValue: order.value || 0,
+        }],
+        totalQuantity: order.pieces || 0,
+        totalValue: order.value || 0,
+      };
     }
 
-    // Add blank row between customers
-    const isLastCustomer = orderIndex === orders.length - 1;
-    if (!isLastCustomer) {
-      rows.push(['', '', '', '', '', '', '', '', '', '']); // 10 columns (A-J)
+    const items = order.items.map(item => ({
+      quantity: item.quantity || 0,
+      description: (item.name + (item.description ? ' - ' + item.description : '')).toUpperCase(),
+      unitValue: item.unitValue || 0,
+      totalValue: item.totalValue || 0,
+    }));
+
+    const itemsTotal = order.items.reduce((sum, item) => sum + (item.totalValue || 0), 0);
+    const totalItemQuantity = order.items.reduce((sum, item) => sum + (item.quantity || 0), 0);
+
+    const totalQuantity = (order.pieces && order.pieces !== totalItemQuantity)
+      ? order.pieces
+      : totalItemQuantity;
+
+    const totalValue = Math.abs(itemsTotal - (order.value || 0)) > 0.01
+      ? (order.value || 0)
+      : itemsTotal;
+
+    return {
+      consignee: (order.consignee || '').toUpperCase(),
+      packageNumber: order.packageNumber || '',
+      items,
+      totalQuantity,
+      totalValue,
+    };
+  });
+};
+
+// ── Pagination: group customers into pages, never splitting a customer ───────
+
+const customerRowCount = (block: CustomerBlock): number =>
+  block.items.length + 1 + 1; // items + TOTAL row + blank separator
+
+const paginateCustomers = (blocks: CustomerBlock[]): CustomerBlock[][] => {
+  const pages: CustomerBlock[][] = [];
+  let currentPage: CustomerBlock[] = [];
+  let currentPageRows = 0;
+
+  for (const block of blocks) {
+    const rows = customerRowCount(block);
+    if (currentPageRows + rows > MAX_DATA_ROWS_PER_PAGE && currentPage.length > 0) {
+      pages.push(currentPage);
+      currentPage = [];
+      currentPageRows = 0;
     }
+    currentPage.push(block);
+    currentPageRows += rows;
   }
 
-  return { dataRows: rows, grandTotal: grandTotalValue };
+  if (currentPage.length > 0) {
+    pages.push(currentPage);
+  }
+
+  return pages;
 };
 
-/**
- * Main export function - generates Excel file using template (preserves ALL formatting)
- * Uses ExcelJS for TRUE 1:1 copy with all styles, colors, fonts, borders, merged cells preserved
- */
+// ── Title block (every page) ─────────────────────────────────────────────────
+
+const writeTitleBlock = (
+  ws: ExcelJS.Worksheet,
+  startRow: number,
+  pageNum: number,
+  totalPages: number,
+) => {
+  // Cross-platform safe: no merges, no theme colors, no centerContinuous.
+  // All text uses explicit argb black, plain alignment.
+
+  // Row 1: "No. de registro de mercancías:" (left) + "Gestor 3145" (right)
+  const r1 = startRow;
+  ws.getCell(`C${r1}`).value = 'No. de registro de mercancías:';
+  ws.getCell(`C${r1}`).font = { ...FONT };
+  ws.getCell(`J${r1}`).value = 'Gestor 3145';
+  ws.getCell(`J${r1}`).font = { ...FONT };
+  ws.getRow(r1).height = ROW_HEIGHT;
+
+  // Row 2: "Codigo de aduana: 3" (left) + "No. de hojas X de Y" (right)
+  const r2 = startRow + 1;
+  ws.getCell(`C${r2}`).value = 'Codigo de aduana: 3';
+  ws.getCell(`C${r2}`).font = { ...FONT };
+  ws.getCell(`J${r2}`).value = `No. de hojas ${pageNum} de ${totalPages}`;
+  ws.getCell(`J${r2}`).font = { ...FONT };
+  ws.getRow(r2).height = ROW_HEIGHT;
+
+  // Row 3: blank
+  ws.getRow(startRow + 2).height = ROW_HEIGHT;
+
+  // Row 4: "DIRECCIÓN GENERAL DE ADUANAS" (bold, in F column — centered within the wide description column)
+  const r4 = startRow + 3;
+  ws.getCell(`F${r4}`).value = 'DIRECCIÓN GENERAL DE ADUANAS';
+  ws.getCell(`F${r4}`).font = { ...FONT_BOLD };
+  ws.getCell(`F${r4}`).alignment = { horizontal: 'center' };
+  ws.getRow(r4).height = ROW_HEIGHT;
+
+  // Row 5: "DIVISIÓN DE OPERACIONES" (bold, in F column)
+  const r5 = startRow + 4;
+  ws.getCell(`F${r5}`).value = 'DIVISIÓN DE OPERACIONES';
+  ws.getCell(`F${r5}`).font = { ...FONT_BOLD };
+  ws.getCell(`F${r5}`).alignment = { horizontal: 'center' };
+  ws.getRow(r5).height = ROW_HEIGHT;
+
+  // Row 6: blank (gap between DIVISIÓN and ANEXO, matching PDF)
+  ws.getRow(startRow + 5).height = ROW_HEIGHT;
+
+  // Row 7: ANEXO text (bold, in C column — long text overflows across empty cells)
+  const r7 = startRow + 6;
+  ws.getCell(`C${r7}`).value =
+    'ANEXO A LA DECLARACIÓN DE MERCANCÍAS PARA PEQUEÑOS ENVÍOS Y DECLARACIÓN DE EQUIPAJE';
+  ws.getCell(`C${r7}`).font = { ...FONT_BOLD };
+  ws.getRow(r7).height = ROW_HEIGHT;
+};
+
+// ── Column headers (page 1 only) ────────────────────────────────────────────
+
+const writeHeaders = (ws: ExcelJS.Worksheet, headerRow: number) => {
+  const row7 = headerRow;
+  const row8 = headerRow + 1;
+
+  const setHeaderCell = (
+    ref: string,
+    value: string,
+    extraAlign?: Partial<ExcelJS.Alignment>,
+    borderOverride?: Partial<ExcelJS.Borders>,
+  ) => {
+    const cell = ws.getCell(ref);
+    cell.value = value;
+    cell.font = { ...FONT_BOLD };
+    cell.alignment = {
+      horizontal: 'center',
+      vertical: 'middle',
+      wrapText: true,
+      shrinkToFit: false,
+      ...extraAlign,
+    };
+    cell.border = borderOverride ?? { left: TB, right: TB, top: TB };
+  };
+
+  setHeaderCell(`C${row7}`, 'Consignatario Persona Natural');
+  setHeaderCell(`D${row7}`, 'No de PK');
+  setHeaderCell(`E${row7}`, 'Cant.', { textRotation: 90 });
+  setHeaderCell(`F${row7}`, 'Descripcion');
+  setHeaderCell(`G${row7}`, 'Mercancias', {}, { left: TB, top: TB, bottom: TB });
+  ws.getCell(`H${row7}`).border = { right: TB, top: TB, bottom: TB };
+  setHeaderCell(`I${row7}`, 'Valor Unit. $');
+  setHeaderCell(`J${row7}`, 'Total');
+  setHeaderCell(`K${row7}`, 'IVA o 30%');
+
+  // Row 8: sub-headers for G/H + bottom borders on all merged header cells
+  for (const col of ['C', 'D', 'E', 'F', 'I', 'J', 'K']) {
+    ws.getCell(`${col}${row8}`).border = { left: TB, right: TB, bottom: TB };
+  }
+
+  // G8: Usado
+  const g8 = ws.getCell(`G${row8}`);
+  g8.value = 'Usado';
+  g8.font = { ...FONT };
+  g8.alignment = { horizontal: 'center', wrapText: true, shrinkToFit: false };
+  g8.border = { ...CELL_BORDER };
+
+  // H8: Nuevo
+  const h8 = ws.getCell(`H${row8}`);
+  h8.value = 'Nuevo';
+  h8.font = { ...FONT };
+  h8.alignment = { horizontal: 'center', wrapText: true, shrinkToFit: false };
+  h8.border = { ...CELL_BORDER };
+
+  ws.getRow(row7).height = ROW_HEIGHT;
+  ws.getRow(row8).height = ROW_HEIGHT;
+
+  // Merges
+  ws.mergeCells(`C${row7}:C${row8}`);
+  ws.mergeCells(`D${row7}:D${row8}`);
+  ws.mergeCells(`E${row7}:E${row8}`);
+  ws.mergeCells(`F${row7}:F${row8}`);
+  ws.mergeCells(`G${row7}:H${row7}`);
+  ws.mergeCells(`I${row7}:I${row8}`);
+  ws.mergeCells(`J${row7}:J${row8}`);
+  ws.mergeCells(`K${row7}:K${row8}`);
+};
+
+// ── Fix ExcelJS dimension bug ────────────────────────────────────────────────
+// ExcelJS miscalculates the worksheet dimension, outputting "D1:K…" instead of
+// "C1:K…". Google Sheets uses this tag to determine the used range and silently
+// drops any data outside it. This helper patches the raw xlsx zip to correct it.
+
+const fixXlsxDimension = async (buffer: ExcelJS.Buffer): Promise<ArrayBuffer> => {
+  const zip = await JSZip.loadAsync(buffer);
+  const sheetPath = 'xl/worksheets/sheet1.xml';
+  const xml = await zip.file(sheetPath)?.async('string');
+  if (!xml) return buffer as ArrayBuffer;
+
+  // Replace dimension ref — ensure column C (min data column) is included
+  const fixed = xml.replace(
+    /<dimension ref="D(\d+):([A-Z]+\d+)"\/>/,
+    '<dimension ref="C$1:$2"/>',
+  );
+
+  if (fixed !== xml) {
+    zip.file(sheetPath, fixed);
+    return zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE' });
+  }
+  return buffer as ArrayBuffer;
+};
+
+// ── Main export function ─────────────────────────────────────────────────────
+
 export const exportOrdersToExcel = async (
-  orders: OrderRow[]
+  orders: OrderRow[],
 ): Promise<{ success: boolean; error?: string }> => {
   try {
     if (!orders || orders.length === 0) {
       return { success: false, error: 'No orders to export' };
     }
 
-    // Sort orders alphabetically by customer name (first name, then last name)
-    // Example: "James Allen" comes before "James Brown"
-    // localeCompare() compares the full name character-by-character
-    const sortedOrders = [...orders].sort((a, b) => {
-      const nameA = (a.consignee || '').toLowerCase().trim();
-      const nameB = (b.consignee || '').toLowerCase().trim();
-      return nameA.localeCompare(nameB);
-    });
+    const blocks = buildCustomerBlocks(orders);
+    const pages = paginateCustomers(blocks);
+    const totalPages = pages.length;
 
-    console.log(`Starting Excel export for ${sortedOrders.length} order(s)...`);
-    console.log('Package numbers being exported (sorted alphabetically):', sortedOrders.map(o => `${o.consignee} (${o.packageNumber})`).join(', '));
+    console.log(
+      `Desarrollo export: ${orders.length} orders → ${blocks.length} customers → ${totalPages} page(s)`,
+    );
 
-    // Fetch the CLEAN template file (only has rows 1-70, no extra sections)
-    const response = await fetch('/PLANTILLA_CLEAN.xlsx');
-    if (!response.ok) {
-      throw new Error('Failed to load Excel template');
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-
-    // Load template workbook with ExcelJS (preserves ALL formatting)
+    // ── Create workbook from scratch ─────────────────────────────────────
     const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(arrayBuffer);
+    const ws = workbook.addWorksheet('CONTROL');
 
-    // Get the CONTROL sheet
-    const worksheet = workbook.getWorksheet('CONTROL');
-    if (!worksheet) {
-      throw new Error('CONTROL sheet not found in template');
+    // Column widths
+    for (const [letter, width] of Object.entries(COLUMN_WIDTHS)) {
+      ws.getColumn(letter).width = width;
     }
 
-    // IMPORTANT: ExcelJS loses merged cells and view settings when we modify cells
-    // We need to preserve them and reapply AFTER all modifications
-    const savedMerges = worksheet.model.merges ? [...worksheet.model.merges] : [];
-    const savedViews = worksheet.views ? [...worksheet.views] : [];
-    console.log(`Template has ${savedMerges.length} merged cells - will restore after modifications`);
-    console.log(`Template views (gridlines hidden): ${savedViews.length > 0 ? savedViews[0].showGridLines === false : 'none'}`);
-
-    // Build our data rows (without SUBTOTAL/signature - those stay in template)
-    const { dataRows, grandTotal} = buildExcelRows(sortedOrders);
-    console.log(`Built ${dataRows.length} data rows from ${sortedOrders.length} order(s), grand total: $${grandTotal}`);
-
-    // STEP 1: Save the formatting AND row height from template rows - BEFORE we clear anything
-    const templateRow = worksheet.getRow(9);
-    const templateRowHeight = templateRow.height || 15; // Default to 15 if not set
-    const templateStyles: any[] = [];
-    for (let col = 1; col <= 10; col++) { // A-J (10 columns, no Categoria)
-      const cell = templateRow.getCell(col);
-      templateStyles[col] = {
-        style: { ...cell.style },
-        border: cell.border ? { ...cell.border } : undefined,
-        fill: cell.fill ? { ...cell.fill } : undefined,
-        font: cell.font ? { ...cell.font } : undefined,
-        alignment: cell.alignment ? { ...cell.alignment } : undefined,
-        numFmt: cell.numFmt,
-      };
-    }
-    console.log(`Saved template row formatting and height (${templateRowHeight}) for dynamic row creation`);
-
-    // CRITICAL: Save SUBTOTAL row (65) formatting BEFORE clearing
-    const originalSubtotalRow = worksheet.getRow(65);
-    const savedSubtotalHeight = originalSubtotalRow.height || templateRowHeight;
-    const savedSubtotalStyles: any[] = [];
-    for (let col = 1; col <= 10; col++) {
-      const cell = originalSubtotalRow.getCell(col);
-      savedSubtotalStyles[col] = {
-        style: cell.style ? { ...cell.style } : undefined,
-        border: cell.border ? { ...cell.border } : undefined,
-        fill: cell.fill ? { ...cell.fill } : undefined,
-        font: cell.font ? { ...cell.font } : undefined,
-        alignment: cell.alignment ? { ...cell.alignment } : undefined,
-        numFmt: cell.numFmt,
-        value: cell.value, // Save the value too (like "SUBTOTAL" label)
-      };
-    }
-
-    // CRITICAL: Save signature rows (68-69) formatting BEFORE clearing
-    const originalSigLineRow = worksheet.getRow(68);
-    const savedSigLineHeight = originalSigLineRow.height || templateRowHeight;
-    const savedSigLineStyles: any[] = [];
-    for (let col = 1; col <= 10; col++) {
-      const cell = originalSigLineRow.getCell(col);
-      savedSigLineStyles[col] = {
-        style: cell.style ? { ...cell.style } : undefined,
-        border: cell.border ? { ...cell.border } : undefined,
-        fill: cell.fill ? { ...cell.fill } : undefined,
-        font: cell.font ? { ...cell.font } : undefined,
-        alignment: cell.alignment ? { ...cell.alignment } : undefined,
-        numFmt: cell.numFmt,
-        value: cell.value, // Save signature lines
-      };
-    }
-
-    const originalSigLabelRow = worksheet.getRow(69);
-    const savedSigLabelHeight = originalSigLabelRow.height || templateRowHeight;
-    const savedSigLabelStyles: any[] = [];
-    for (let col = 1; col <= 10; col++) {
-      const cell = originalSigLabelRow.getCell(col);
-      savedSigLabelStyles[col] = {
-        style: cell.style ? { ...cell.style } : undefined,
-        border: cell.border ? { ...cell.border } : undefined,
-        fill: cell.fill ? { ...cell.fill } : undefined,
-        font: cell.font ? { ...cell.font } : undefined,
-        alignment: cell.alignment ? { ...cell.alignment } : undefined,
-        numFmt: cell.numFmt,
-        value: cell.value, // Save "Nombre" and "Firma" labels
-      };
-    }
-
-    // Also save blank rows 66-67 (between SUBTOTAL and signature)
-    const originalBlankRow66 = worksheet.getRow(66);
-    const savedBlankRow66Height = originalBlankRow66.height || templateRowHeight;
-
-    const originalBlankRow67 = worksheet.getRow(67);
-    const savedBlankRow67Height = originalBlankRow67.height || templateRowHeight;
-
-    console.log('Saved SUBTOTAL and signature formatting before clearing');
-
-    // STEP 2: Clear ALL existing data from row 9 to row 70 (entire template area including old SUBTOTAL/signature)
-    // This must happen BEFORE writing new data to avoid accidentally clearing our new data
-    console.log('Clearing template rows 9-70 before writing new data');
-    for (let rowNum = 9; rowNum <= 70; rowNum++) {
-      const row = worksheet.getRow(rowNum);
-      for (let col = 1; col <= 10; col++) {
-        const cell = row.getCell(col);
-        cell.value = null;
-        cell.dataValidation = null;
-      }
-    }
-
-    // STEP 3: Write data with automatic 68-row pagination
-    // Each "page" is 68 rows: First page has header (rows 1-8) + data (rows 9-67) + signature (row 68)
-    // Subsequent pages: data + signature at row 136, 204, 272, etc.
-    const dataStartRow = 9;
-    const ROWS_PER_PAGE = 68;
-    const FIRST_PAGE_DATA_ROWS = 59; // Rows 9-67 (row 68 is signature)
-    const SUBSEQUENT_PAGE_DATA_ROWS = 67; // 68 rows minus 1 for signature
-
-    let currentRowNumber = dataStartRow;
-    let dataRowsOnCurrentPage = 0; // Per-page counter (resets after each signature)
-    let isFirstPage = true;
-
-    // Helper function to add signature rows (line + labels, like template rows 68-69)
-    const addSignatureRows = (startRowNum: number) => {
-      console.log(`Adding signature at rows ${startRowNum}-${startRowNum + 1}`);
-
-      // Signature line row (template row 68)
-      const sigLineRow = worksheet.getRow(startRowNum);
-      sigLineRow.height = savedSigLineHeight;
-      for (let col = 1; col <= 10; col++) {
-        const cell = sigLineRow.getCell(col);
-        const savedStyle = savedSigLineStyles[col];
-        if (savedStyle) {
-          if (savedStyle.style) cell.style = { ...savedStyle.style };
-          if (savedStyle.border) cell.border = { ...savedStyle.border };
-          if (savedStyle.fill) cell.fill = { ...savedStyle.fill };
-          if (savedStyle.font) cell.font = { ...savedStyle.font };
-          if (savedStyle.alignment) cell.alignment = { ...savedStyle.alignment };
-          if (savedStyle.numFmt) cell.numFmt = savedStyle.numFmt;
-          if (savedStyle.value) cell.value = savedStyle.value;
-        }
-      }
-
-      // Signature label row (template row 69 - "Nombre" / "Firma")
-      const sigLabelRow = worksheet.getRow(startRowNum + 1);
-      sigLabelRow.height = savedSigLabelHeight;
-      for (let col = 1; col <= 10; col++) {
-        const cell = sigLabelRow.getCell(col);
-        const savedStyle = savedSigLabelStyles[col];
-        if (savedStyle) {
-          if (savedStyle.style) cell.style = { ...savedStyle.style };
-          if (savedStyle.border) cell.border = { ...savedStyle.border };
-          if (savedStyle.fill) cell.fill = { ...savedStyle.fill };
-          if (savedStyle.font) cell.font = { ...savedStyle.font };
-          if (savedStyle.alignment) cell.alignment = { ...savedStyle.alignment };
-          if (savedStyle.numFmt) cell.numFmt = savedStyle.numFmt;
-          if (savedStyle.value) cell.value = savedStyle.value;
-        }
-      }
+    // Hide gridlines + page setup
+    ws.views = [{ showGridLines: false }];
+    ws.pageSetup = {
+      fitToPage: true,
+      fitToWidth: 1,
+      fitToHeight: 0,
+      orientation: 'portrait',
+      margins: {
+        left: 0.25, right: 0.25,
+        top: 0.93, bottom: 0.75,
+        header: 0, footer: 0,
+      },
+      showGridLines: false,
+      showRowColHeaders: false,
     };
 
-    for (let i = 0; i < dataRows.length; i++) {
-      const rowData = dataRows[i];
+    let currentRow = 1;
+    const subtotalJRefs: string[] = [];
 
-      // Check if current page is full and we need a signature break
-      const maxRowsThisPage = isFirstPage ? FIRST_PAGE_DATA_ROWS : SUBSEQUENT_PAGE_DATA_ROWS;
+    // ── Write pages ──────────────────────────────────────────────────────
+    for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+      const page = pages[pageIndex];
+      const isFirstPage = pageIndex === 0;
+      const isLastPage = pageIndex === pages.length - 1;
 
-      if (dataRowsOnCurrentPage >= maxRowsThisPage) {
-        // Add SUBTOTAL row at current position
-        const subtotalRow = worksheet.getRow(currentRowNumber);
-        subtotalRow.height = savedSubtotalHeight;
-        for (let col = 1; col <= 10; col++) {
-          const cell = subtotalRow.getCell(col);
-          const savedStyle = savedSubtotalStyles[col];
-          if (savedStyle) {
-            if (savedStyle.style) cell.style = { ...savedStyle.style };
-            if (savedStyle.border) cell.border = { ...savedStyle.border };
-            if (savedStyle.fill) cell.fill = { ...savedStyle.fill };
-            if (savedStyle.font) cell.font = { ...savedStyle.font };
-            if (savedStyle.alignment) cell.alignment = { ...savedStyle.alignment };
-            if (savedStyle.numFmt) cell.numFmt = savedStyle.numFmt;
-            if (savedStyle.value) cell.value = savedStyle.value;
+      // Title block on every page (7 rows)
+      writeTitleBlock(ws, currentRow, pageIndex + 1, totalPages);
+      currentRow += 7;
+
+      // Blank row between title and content (all pages, matching PDF)
+      ws.getRow(currentRow).height = ROW_HEIGHT;
+      currentRow++;
+
+      if (isFirstPage) {
+        // Column headers (page 1 only): 2 rows
+        writeHeaders(ws, currentRow);
+        currentRow += 2;
+      }
+
+      // ── Write customer blocks for this page ────────────────────────────
+      const customerTotalJRefs: string[] = [];
+
+      for (const block of page) {
+        const firstItemRow = currentRow;
+
+        // Item rows
+        for (let itemIndex = 0; itemIndex < block.items.length; itemIndex++) {
+          const item = block.items[itemIndex];
+          ws.getRow(currentRow).height = ROW_HEIGHT;
+
+          if (itemIndex === 0) {
+            const cCell = ws.getCell(`C${currentRow}`);
+            cCell.value = block.consignee;
+            cCell.font = { ...FONT };
+
+            const dCell = ws.getCell(`D${currentRow}`);
+            dCell.value = block.packageNumber;
+            dCell.font = { ...FONT_BOLD };
           }
-        }
-        currentRowNumber++;
 
-        // Add blank rows (66-67 equivalent) before signature
-        worksheet.getRow(currentRowNumber).height = savedBlankRow66Height;
-        currentRowNumber++;
-        worksheet.getRow(currentRowNumber).height = savedBlankRow67Height;
-        currentRowNumber++;
+          const eCell = ws.getCell(`E${currentRow}`);
+          eCell.value = item.quantity;
+          eCell.font = { ...FONT };
 
-        // Add signature rows
-        addSignatureRows(currentRowNumber);
-        currentRowNumber += 2; // Skip past both signature rows
+          const fCell = ws.getCell(`F${currentRow}`);
+          fCell.value = item.description;
+          fCell.font = { ...FONT };
 
-        // Reset per-page counter
-        dataRowsOnCurrentPage = 0;
-        isFirstPage = false;
-      }
+          const hCell = ws.getCell(`H${currentRow}`);
+          hCell.value = 'X';
+          hCell.font = { ...FONT };
 
-      // Write data row
-      const row = worksheet.getRow(currentRowNumber);
-      row.height = templateRowHeight;
+          const iCell = ws.getCell(`I${currentRow}`);
+          iCell.value = item.unitValue;
+          iCell.font = { ...FONT };
+          iCell.numFmt = CURRENCY_FORMAT;
 
-      // Detect per-customer total row
-      const isPerCustomerTotal =
-        !rowData[1] && !rowData[2] && rowData[3] && !rowData[4] && rowData[8];
+          const jCell = ws.getCell(`J${currentRow}`);
+          jCell.value = item.totalValue;
+          jCell.font = { ...FONT };
+          jCell.numFmt = CURRENCY_FORMAT;
 
-      // Apply template formatting
-      for (let col = 1; col <= 10; col++) {
-        const cell = row.getCell(col);
-        const template = templateStyles[col];
-        if (template) {
-          if (template.style) cell.style = { ...template.style };
-          if (template.border) cell.border = { ...template.border };
-          if (template.fill) cell.fill = { ...template.fill };
-          if (template.font) cell.font = { ...template.font };
-          if (template.alignment) cell.alignment = { ...template.alignment };
-          if (template.numFmt) cell.numFmt = template.numFmt;
+          // Grid borders on all cells C-K
+          applyGridBorders(ws, currentRow);
+          currentRow++;
         }
 
-        if (isPerCustomerTotal && col === 4) {
-          cell.font = { ...cell.font, bold: true };
-        }
-      }
+        const lastItemRow = currentRow - 1;
 
-      // Set values
-      rowData.forEach((value, index) => {
-        if (index > 0 && value !== undefined && value !== '') {
-          const cell = row.getCell(index + 1);
-          cell.value = value;
-          cell.dataValidation = null;
-        }
-      });
+        // ── Customer TOTAL row ─────────────────────────────────────────
+        ws.getRow(currentRow).height = ROW_HEIGHT;
 
-      currentRowNumber++;
-      dataRowsOnCurrentPage++;
-    }
+        const eTotal = ws.getCell(`E${currentRow}`);
+        eTotal.value = block.totalQuantity;
+        eTotal.font = { ...FONT_BOLD };
 
-    console.log(`Wrote ${dataRows.length} data rows with automatic pagination`);
+        const iTotal = ws.getCell(`I${currentRow}`);
+        iTotal.value = 'TOTAL';
+        iTotal.font = { ...FONT_BOLD };
 
-    // Add final SUBTOTAL + signature after all data
-    // SUBTOTAL row
-    const finalSubtotalRow = worksheet.getRow(currentRowNumber);
-    finalSubtotalRow.height = savedSubtotalHeight;
-    for (let col = 1; col <= 10; col++) {
-      const cell = finalSubtotalRow.getCell(col);
-      const savedStyle = savedSubtotalStyles[col];
-      if (savedStyle) {
-        if (savedStyle.style) cell.style = { ...savedStyle.style };
-        if (savedStyle.border) cell.border = { ...savedStyle.border };
-        if (savedStyle.fill) cell.fill = { ...savedStyle.fill };
-        if (savedStyle.font) cell.font = { ...savedStyle.font };
-        if (savedStyle.alignment) cell.alignment = { ...savedStyle.alignment };
-        if (savedStyle.numFmt) cell.numFmt = savedStyle.numFmt;
-        if (savedStyle.value) cell.value = savedStyle.value;
-      }
-    }
-    // Write grand total value into SUBTOTAL row column I
-    finalSubtotalRow.getCell(9).value = grandTotal;
-    currentRowNumber++;
-
-    // Blank rows before signature
-    worksheet.getRow(currentRowNumber).height = savedBlankRow66Height;
-    currentRowNumber++;
-    worksheet.getRow(currentRowNumber).height = savedBlankRow67Height;
-    currentRowNumber++;
-
-    // Final signature
-    addSignatureRows(currentRowNumber);
-    console.log(`Added final signature at rows ${currentRowNumber}-${currentRowNumber + 1}`);
-
-    // CRITICAL: Re-apply merged cells from template for header area only
-    // Signature rows are now dynamically placed, so we don't merge those from template
-    console.log(`Restoring header merged cells from template...`);
-    console.log('Saved merges:', savedMerges);
-
-    const adjustedMerges: string[] = [];
-
-    for (const mergeRange of savedMerges) {
-      try {
-        const [start, end] = mergeRange.split(':');
-        const startRow = parseInt(start.match(/\d+/)?.[0] || '0');
-        const endRow = parseInt(end.match(/\d+/)?.[0] || '0');
-
-        let adjustedRange = mergeRange;
-
-        // Only preserve header merges (rows 1-8)
-        if (startRow <= 8 && endRow <= 8) {
-          adjustedRange = mergeRange;
-          adjustedMerges.push(adjustedRange);
-
-          const startCell = worksheet.getCell(adjustedRange.split(':')[0]);
-          if (!startCell.isMerged) {
-            worksheet.mergeCells(adjustedRange);
-            console.log(`  ✓ Applied header merge: ${adjustedRange}`);
-          }
+        const jTotal = ws.getCell(`J${currentRow}`);
+        if (block.items.length > 1) {
+          jTotal.value = { formula: `SUM(J${firstItemRow}:J${lastItemRow})` };
         } else {
-          console.log(`  Skipping data/signature merge: ${mergeRange} (not needed with dynamic pagination)`);
+          jTotal.value = block.totalValue;
         }
-      } catch (error) {
-        console.warn(`  ✗ Failed to merge ${mergeRange}:`, error);
+        jTotal.font = { ...FONT_BOLD };
+        jTotal.numFmt = CURRENCY_FORMAT;
+
+        // Grid borders on TOTAL row too
+        applyGridBorders(ws, currentRow);
+
+        customerTotalJRefs.push(`J${currentRow}`);
+        currentRow++;
+
+        // Blank separator row (still part of the grid — gets borders)
+        ws.getRow(currentRow).height = ROW_HEIGHT;
+        applyGridBorders(ws, currentRow);
+        currentRow++;
+      }
+
+      // ── Page SUBTOTAL row ────────────────────────────────────────────
+      ws.getRow(currentRow).height = ROW_HEIGHT;
+
+      const hSub = ws.getCell(`H${currentRow}`);
+      hSub.value = 'SUBTOTAL';
+      hSub.font = { ...FONT_BOLD };
+
+      const iSub = ws.getCell(`I${currentRow}`);
+      iSub.value = 'SUBTOTAL';
+      iSub.font = { ...FONT_BOLD };
+
+      const jSub = ws.getCell(`J${currentRow}`);
+      jSub.value = { formula: customerTotalJRefs.join('+') };
+      jSub.font = { ...FONT_BOLD };
+      jSub.numFmt = CURRENCY_FORMAT;
+
+      // SUBTOTAL has special border pattern (H/J merge visual)
+      applySubtotalBorders(ws, currentRow);
+
+      subtotalJRefs.push(`J${currentRow}`);
+      currentRow++;
+
+      // ── Grand TOTAL (last page only, when multiple pages) ────────────
+      if (isLastPage && totalPages > 1) {
+        ws.getRow(currentRow).height = ROW_HEIGHT;
+
+        const iGrand = ws.getCell(`I${currentRow}`);
+        iGrand.value = 'TOTAL';
+        iGrand.font = { ...FONT_BOLD };
+
+        const jGrand = ws.getCell(`J${currentRow}`);
+        jGrand.value = { formula: subtotalJRefs.join('+') };
+        jGrand.font = { ...FONT_BOLD };
+        jGrand.numFmt = CURRENCY_FORMAT;
+
+        // Same border pattern as SUBTOTAL
+        applySubtotalBorders(ws, currentRow);
+        currentRow++;
+      }
+
+      // ── 2 blank rows + signature (NO borders — outside the grid) ────
+      ws.getRow(currentRow).height = ROW_HEIGHT;
+      currentRow++;
+      ws.getRow(currentRow).height = ROW_HEIGHT;
+      currentRow++;
+
+      // Signature lines
+      ws.getRow(currentRow).height = ROW_HEIGHT;
+      ws.getCell(`D${currentRow}`).value = '__________________';
+      ws.getCell(`D${currentRow}`).font = { ...FONT };
+      ws.getCell(`I${currentRow}`).value = '__________________';
+      ws.getCell(`I${currentRow}`).font = { ...FONT };
+      currentRow++;
+
+      // Labels
+      ws.getRow(currentRow).height = ROW_HEIGHT;
+      ws.getCell(`D${currentRow}`).value = 'Nombre';
+      ws.getCell(`D${currentRow}`).font = { ...FONT };
+      ws.getCell(`J${currentRow}`).value = 'Firma';
+      ws.getCell(`J${currentRow}`).font = { ...FONT };
+      currentRow++;
+
+      // Blank row between pages (not after last page)
+      if (!isLastPage) {
+        ws.getRow(currentRow).height = ROW_HEIGHT;
+        currentRow++;
       }
     }
 
-    worksheet.model.merges = adjustedMerges;
-    console.log(`Final merge count: ${adjustedMerges.length} (header only)`);
+    // No white fill — showGridLines:false handles grid hiding.
+    // Applying fill creates a visible "used range" outline in Numbers/Excel.
 
-    // CRITICAL: Restore view settings (including showGridLines: false)
-    if (savedViews && savedViews.length > 0) {
-      worksheet.views = savedViews;
-      console.log('✓ Restored view settings (gridlines hidden)');
-    }
-
-    // Generate filename with timestamp
+    // ── Generate & download ──────────────────────────────────────────────
     const timestamp = new Date().toLocaleDateString('en-US', {
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
     }).replace(/\//g, '-');
 
-    const filename = `Customs_Export_${timestamp}_${sortedOrders.length}orders.xlsx`;
+    const filename = `Desarrollo_Export_${timestamp}_${orders.length}orders.xlsx`;
 
-    // Write to buffer
-    const buffer = await workbook.xlsx.writeBuffer();
+    const rawBuffer = await workbook.xlsx.writeBuffer();
 
-    // Create blob and trigger download
-    const blob = new Blob([buffer], {
-      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    // Fix ExcelJS dimension bug: it calculates "D1:K…" instead of "C1:K…",
+    // which causes Google Sheets to ignore all column C content on import.
+    const fixedBuffer = await fixXlsxDimension(rawBuffer);
+
+    const blob = new Blob([fixedBuffer], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     });
 
     const url = window.URL.createObjectURL(blob);
@@ -525,7 +532,7 @@ export const exportOrdersToExcel = async (
     document.body.removeChild(link);
     window.URL.revokeObjectURL(url);
 
-    console.log('✓ Export successful! File downloaded with ALL formatting preserved.');
+    console.log(`✓ Desarrollo export complete: ${filename}`);
     return { success: true };
   } catch (error) {
     console.error('Export failed:', error);
