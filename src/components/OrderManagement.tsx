@@ -5,7 +5,7 @@ import { db } from '../services/firebase';
 import { exportOrdersToGoogleDocs, startNewGoogleDoc } from '../services/orderExportService';
 import { exportOrdersToGoogleSheets, startNewGoogleSheet } from '../services/orderSheetsExportService';
 import { exportOrdersToGoogleSheet } from '../services/orderExcelExportService';
-import { extractItemsFromDocText } from '../services/geminiService';
+import { extractItemsFromDocText, analyzeOrderScreenshot } from '../services/geminiService';
 import mammoth from 'mammoth';
 import type { PackageItem } from '../types';
 
@@ -46,6 +46,7 @@ export default function OrderManagement() {
   const [galleryImages, setGalleryImages] = useState<string[]>([]);
   const [currentImageIndex, setCurrentImageIndex] = useState(0);
   const [importingDoc, setImportingDoc] = useState(false);
+  const [rescanning, setRescanning] = useState(false);
   const wordDocInputRef = React.useRef<HTMLInputElement>(null);
 
   // Filter state
@@ -212,6 +213,80 @@ export default function OrderManagement() {
     } catch (error) {
       console.error('Error deleting rows:', error);
       alert('Failed to delete rows');
+    }
+  };
+
+  const handleRescanSelected = async () => {
+    if (selectedRows.size === 0 || !currentUser?.organizationId) return;
+
+    const ordersToRescan = orders.filter(o => selectedRows.has(o.id) && o.screenshotUrls?.length > 0);
+    if (ordersToRescan.length === 0) {
+      alert('Selected orders have no screenshots to re-scan.');
+      return;
+    }
+
+    const confirmed = confirm(`Re-scan ${ordersToRescan.length} order(s)? This will re-extract items from their screenshots using AI.`);
+    if (!confirmed) return;
+
+    setRescanning(true);
+    let successCount = 0;
+
+    try {
+      for (const order of ordersToRescan) {
+        try {
+          const allItems: PackageItem[] = [];
+          let totalValue = 0;
+          let totalPieces = 0;
+
+          for (const url of order.screenshotUrls) {
+            // Fetch screenshot from Firebase Storage and convert to base64
+            const response = await fetch(url);
+            const blob = await response.blob();
+            const base64 = await new Promise<string>((resolve) => {
+              const reader = new FileReader();
+              reader.onloadend = () => {
+                const dataUrl = reader.result as string;
+                resolve(dataUrl.split(',')[1]);
+              };
+              reader.readAsDataURL(blob);
+            });
+
+            const extracted = await analyzeOrderScreenshot(base64);
+            if (extracted.items?.length) {
+              allItems.push(...extracted.items);
+            }
+            totalValue += extracted.orderTotal || 0;
+            totalPieces += extracted.totalPieces || 0;
+          }
+
+          // Update order in Firestore
+          const orderRef = doc(db, 'organizations', currentUser.organizationId, 'orders', order.id);
+          await updateDoc(orderRef, {
+            items: allItems,
+            value: totalValue || order.value,
+            pieces: totalPieces || order.pieces,
+          });
+
+          // Update local state
+          setOrders(prev => prev.map(o => o.id === order.id ? {
+            ...o,
+            items: allItems,
+            value: totalValue || o.value,
+            pieces: totalPieces || o.pieces,
+          } : o));
+
+          successCount++;
+        } catch (err) {
+          console.error(`Failed to re-scan order ${order.consignee}:`, err);
+        }
+      }
+
+      alert(`✅ Re-scanned ${successCount}/${ordersToRescan.length} orders`);
+    } catch (error) {
+      console.error('Re-scan failed:', error);
+      alert('Re-scan failed: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    } finally {
+      setRescanning(false);
     }
   };
 
@@ -826,8 +901,27 @@ export default function OrderManagement() {
                 </button>
 
                 <button
+                  onClick={handleRescanSelected}
+                  disabled={exporting || exportingSheets || rescanning}
+                  className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-amber-600 hover:bg-amber-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors whitespace-nowrap"
+                >
+                  {rescanning ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin inline-block mr-1"></div>
+                      <span className="hidden sm:inline">Re-scanning...</span>
+                      <span className="sm:hidden">...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="hidden sm:inline">🔄 Re-scan</span>
+                      <span className="sm:hidden">🔄</span>
+                    </>
+                  )}
+                </button>
+
+                <button
                   onClick={handleDeleteSelected}
-                  disabled={exporting || exportingSheets}
+                  disabled={exporting || exportingSheets || rescanning}
                   className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-red-600 hover:bg-red-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors whitespace-nowrap"
                 >
                   <span className="hidden sm:inline">🗑️ Delete</span>
