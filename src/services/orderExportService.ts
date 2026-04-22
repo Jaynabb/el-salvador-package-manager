@@ -426,21 +426,25 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
     index += 1;
   };
 
-  // Pre-normalize ALL images in parallel (biggest speed win — was sequential before)
+  // Pre-normalize ALL images with controlled concurrency.
+  // 6 at a time avoids overwhelming the browser/network while still being fast.
+  const CONCURRENCY = 6;
   const normalizedUrlMap = new Map<string, string>();
   const allImageUrls = orders.flatMap(o => o.screenshotUrls || []);
   if (allImageUrls.length > 0) {
-    const results = await Promise.allSettled(
-      allImageUrls.map(async (url) => {
-        const normalized = await normalizeImage(url, organizationId);
-        return { original: url, normalized };
-      })
-    );
-    for (const result of results) {
-      if (result.status === 'fulfilled') {
-        normalizedUrlMap.set(result.value.original, result.value.normalized);
+    const queue = [...allImageUrls];
+    const processNext = async (): Promise<void> => {
+      while (queue.length > 0) {
+        const url = queue.shift()!;
+        try {
+          const normalized = await normalizeImage(url, organizationId);
+          normalizedUrlMap.set(url, normalized);
+        } catch (err) {
+          console.warn('Image normalization failed, using original:', err);
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, allImageUrls.length) }, () => processNext()));
   }
 
   // Format each order - SIMPLE format with only 4 fields + screenshots
