@@ -154,8 +154,9 @@ Return data in this EXACT JSON format:
   "shippingCarrier": "USPS|UPS|FedEx|DHL|YunExpress|other or null",
   "items": [
     {
-      "name": "product name",
+      "name": "full product name as shown on screenshot",
       "description": "brief description or null",
+      "customsDescription": "SHORT customs description in Spanish (3-5 words max): item type + color ONLY. NO brand names, NO marketing text, NO sizes. Examples: 'Calzoncillos Boxer Negro', 'Vestido Rojo Mujer', 'Consola Juegos Portátil', 'Camiseta Blanca Mujer'. If screenshot is in English, translate to Spanish.",
       "quantity": number,
       "unitValue": number (price per unit in USD),
       "totalValue": number (quantity × unitValue),
@@ -292,6 +293,7 @@ Return ONLY valid JSON.`;
         parsed.items = parsed.items.map((item) => ({
             name: item.name || "Unknown Item",
             description: item.description || null,
+            customsDescription: item.customsDescription || null,
             quantity: item.quantity || 1,
             unitValue: item.unitValue || 0,
             totalValue: item.totalValue || (item.unitValue || 0) * (item.quantity || 1),

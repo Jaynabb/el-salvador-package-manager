@@ -332,7 +332,9 @@ const setupGoogleDrive = async (
   });
 
   if (!folderResponse.ok) {
-    throw new Error('Failed to create Drive folder');
+    const errBody = await folderResponse.json().catch(() => ({}));
+    console.error('Drive folder creation failed:', folderResponse.status, errBody);
+    throw new Error(`Failed to create Drive folder: ${errBody?.error?.message || folderResponse.status}`);
   }
 
   const folder = await folderResponse.json();
@@ -490,21 +492,38 @@ export const handleOrganizationOAuthCallback = async (code: string): Promise<{
 
     console.log('✓ Refresh token received - connection will auto-renew');
 
+    // Log granted scopes to help debug permission issues
+    const grantedScopes = tokenResponse.scope || '';
+    console.log('📋 Granted scopes:', grantedScopes);
+    if (!grantedScopes.includes('drive')) {
+      console.warn('⚠️ Drive scope was NOT granted by the user — Drive folder creation will fail');
+    }
+
     // Get user's Google email
     const userInfo = await fetchGoogleUserInfo(tokenResponse.access_token);
 
-    // Create Drive folder for exported docs (no sheets stored in customer Drive)
-    const { folderId } = await setupGoogleDrive(tokenResponse.access_token, organizationId);
+    // Create Drive folder for exported docs (non-fatal — connection still works without it)
+    let folderId: string | undefined;
+    try {
+      const driveResult = await setupGoogleDrive(tokenResponse.access_token, organizationId);
+      folderId = driveResult.folderId;
+    } catch (driveError) {
+      console.warn('⚠️ Drive folder creation failed (non-fatal):', driveError);
+      // Continue without folder — exports will still work, just won't be organized in a folder
+    }
 
     // Store tokens in Firestore organization
-    await updateOrganizationGoogleAuth(organizationId, {
+    const authData: Record<string, unknown> = {
       googleConnected: true,
       googleAccessToken: tokenResponse.access_token,
       googleRefreshToken: tokenResponse.refresh_token,
       googleTokenExpiry: new Date(Date.now() + (tokenResponse.expires_in * 1000)),
       googleEmail: userInfo.email,
-      googleDriveFolderId: folderId,
-    });
+    };
+    if (folderId) {
+      authData.googleDriveFolderId = folderId;
+    }
+    await updateOrganizationGoogleAuth(organizationId, authData);
 
     console.log('✓ Google tokens saved to Firestore with refresh token');
 

@@ -1,5 +1,6 @@
 import { doc, getDoc, updateDoc, collection, addDoc } from 'firebase/firestore';
-import { db } from './firebase';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { db, storage } from './firebase';
 import type { OrderRow } from '../components/OrderManagement';
 import type { Organization } from '../types';
 
@@ -8,13 +9,68 @@ import type { Organization } from '../types';
  * Exports orders to Google Docs in the specified format
  */
 
+// Fixed screenshot size for Machote export: 3.11" × 4.01" (per user specification).
+// Every image is normalized to this exact size via canvas before insertion.
+// 2 images fit per page with the header text.
+const IMG_WIDTH_PT = 223.92;  // 3.11 inches × 72
+const IMG_HEIGHT_PT = 288.72; // 4.01 inches × 72
+const CANVAS_WIDTH = Math.round(IMG_WIDTH_PT * 2);   // 448px (2x for retina)
+const CANVAS_HEIGHT = Math.round(IMG_HEIGHT_PT * 2);  // 578px
+
+/**
+ * Normalize an image to exact 3.11" × 4.01" dimensions.
+ * Fetches the image, draws it center-fit on a portrait canvas, uploads the result.
+ * Every image in the Machote will be exactly the same size — no variation.
+ */
+const normalizeImage = async (
+  imageUrl: string,
+  organizationId: string
+): Promise<string> => {
+  const response = await fetch(imageUrl);
+  if (!response.ok) throw new Error(`Failed to fetch image (${response.status})`);
+  const imageBlob = await response.blob();
+  const blobUrl = URL.createObjectURL(imageBlob);
+
+  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const el = new Image();
+    el.onload = () => resolve(el);
+    el.onerror = () => reject(new Error('Failed to decode image'));
+    el.src = blobUrl;
+  });
+
+  const canvas = document.createElement('canvas');
+  canvas.width = CANVAS_WIDTH;
+  canvas.height = CANVAS_HEIGHT;
+  const ctx = canvas.getContext('2d')!;
+
+  // Crop-to-fill: scale image to COVER the entire canvas, crop excess from edges.
+  // No white space ever — the full 3.11"×4.01" area is filled with screenshot content.
+  // For tall phone screenshots, the top/bottom edges get cropped (center preserved).
+  const scale = Math.max(CANVAS_WIDTH / img.naturalWidth, CANVAS_HEIGHT / img.naturalHeight);
+  const drawW = img.naturalWidth * scale;
+  const drawH = img.naturalHeight * scale;
+  ctx.drawImage(img, (CANVAS_WIDTH - drawW) / 2, (CANVAS_HEIGHT - drawH) / 2, drawW, drawH);
+
+  URL.revokeObjectURL(blobUrl);
+
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(b => b ? resolve(b) : reject(new Error('toBlob failed')), 'image/jpeg', 0.92);
+  });
+
+  if (!storage) throw new Error('Firebase Storage not initialized');
+  const fileName = `machote-temp/org_${organizationId}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.jpg`;
+  const storageRef = ref(storage, fileName);
+  await uploadBytes(storageRef, blob);
+  return getDownloadURL(storageRef);
+};
+
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
 const CLIENT_SECRET = import.meta.env.VITE_GOOGLE_CLIENT_SECRET || '';
 
 /**
  * Refresh access token using refresh token
  */
-const refreshGoogleToken = async (refreshToken: string): Promise<string> => {
+export const refreshGoogleToken = async (refreshToken: string): Promise<string> => {
   const response = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: {
@@ -48,7 +104,7 @@ const refreshGoogleToken = async (refreshToken: string): Promise<string> => {
 /**
  * Get valid access token from organization (refresh if needed)
  */
-const getValidAccessToken = async (organizationId: string): Promise<string> => {
+export const getValidAccessToken = async (organizationId: string): Promise<string> => {
   console.log('🔍 getValidAccessToken called with organizationId:', organizationId);
   console.log('🔍 Creating document reference...');
   const orgRef = doc(db, 'organizations', organizationId);
@@ -223,7 +279,7 @@ const createOrAppendOrderDocument = async (
   }
 
   // Build document content (with screenshots)
-  const requests = await buildOrderDocumentRequests(orders, accessToken, startIndex);
+  const requests = await buildOrderDocumentRequests(orders, accessToken, organizationId, startIndex);
 
   // Format the document
   const formatResponse = await fetch(
@@ -310,7 +366,7 @@ const createNewDocument = async (
  *
  * [Next order...]
  */
-const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: string, startIndex: number = 1): Promise<any[]> => {
+const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: string, organizationId: string, startIndex: number = 1): Promise<any[]> => {
   const requests: any[] = [];
   let index = startIndex; // Start at specified index (for appending)
 
@@ -343,27 +399,31 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
     });
   };
 
-  // Helper to insert image
-  // Optimized size: Width 2-3", Height 1-2" to fit multiple screenshots inline
-  // 180x135 PT = 2.5" x 1.875" (maintains 4:3 aspect ratio)
-  const insertImage = async (imageUrl: string) => {
+  // Helper to insert image within 465×580 PT bounding box.
+  // Landscape images fill the width, portrait images fill the height.
+  // Either way, the image + header always fits on one page (no blank pages).
+  const insertImage = (imageUrl: string) => {
     requests.push({
       insertInlineImage: {
         location: { index },
         uri: imageUrl,
         objectSize: {
-          height: {
-            magnitude: 135,
-            unit: 'PT',
-          },
-          width: {
-            magnitude: 180,
-            unit: 'PT',
-          },
+          width: { magnitude: IMG_WIDTH_PT, unit: 'PT' },
+          height: { magnitude: IMG_HEIGHT_PT, unit: 'PT' },
         },
       },
     });
-    index += 1; // Images take up 1 character position
+    index += 1;
+  };
+
+  // Helper to insert a page break
+  const insertPageBreak = () => {
+    requests.push({
+      insertPageBreak: {
+        location: { index },
+      },
+    });
+    index += 1;
   };
 
   // Format each order - SIMPLE format with only 4 fields + screenshots
@@ -399,18 +459,31 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
       insertText(`VALOR: $${Number(order.value).toFixed(2)}\n`);
     }
 
-    // 5. Screenshots - insert ALL screenshots for this order
+    // 5. Screenshots — normalized to exactly 3.11"×4.01", 2 per page with header.
+    // Page break after every 2nd image enforces 2-2-1 grouping.
     if (order.screenshotUrls && order.screenshotUrls.length > 0) {
-      for (const screenshotUrl of order.screenshotUrls) {
-        await insertImage(screenshotUrl);
-        insertText(' ');
+      for (let i = 0; i < order.screenshotUrls.length; i++) {
+        let url = order.screenshotUrls[i];
+        try {
+          url = await normalizeImage(order.screenshotUrls[i], organizationId);
+        } catch (err) {
+          console.warn(`Image ${i} normalization failed, using original:`, err);
+        }
+        insertImage(url);
+        // After every 2nd image, page break if more images remain
+        if (i % 2 === 1 && i < order.screenshotUrls.length - 1) {
+          insertPageBreak();
+          insertText('\n');
+        } else {
+          insertText('\n');
+        }
       }
-      insertText('\n');
     }
 
-    // Add spacing between orders
+    // Each customer starts on a fresh page — their text header and screenshots
+    // stay together. Previous customer's remaining page space is left blank.
     if (orderIndex < orders.length - 1) {
-      insertText('\n');
+      insertPageBreak();
     }
   }
 

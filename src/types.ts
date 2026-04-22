@@ -125,6 +125,7 @@ export interface Customer {
 export interface PackageItem {
   name: string;
   description?: string;
+  customsDescription?: string; // Short Spanish customs description (3-5 words: item type + color)
   quantity: number;
   unitValue: number; // Value per unit in USD
   totalValue: number; // quantity * unitValue

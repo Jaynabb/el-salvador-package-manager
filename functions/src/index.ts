@@ -184,18 +184,52 @@ async function processMultipleScreenshots(
 
   console.log(`All ${screenshots.length} screenshots uploaded successfully`);
 
-  // Extract data with Gemini AI from FIRST screenshot
-  // (We could potentially analyze all and merge data, but for now use first)
-  const firstScreenshot = screenshots[0];
-  const base64 = firstScreenshot.imageBytes.toString("base64");
+  // Extract data with Gemini AI from ALL screenshots (in parallel)
+  console.log(`Starting AI extraction for ${screenshots.length} screenshots of ${customerName}`);
 
-  console.log(`Starting AI extraction for ${customerName}, content-type: ${firstScreenshot.mediaContentType}`);
-  const extractedData = await analyzeOrderScreenshot(base64, firstScreenshot.mediaContentType);
+  const extractionResults = await Promise.allSettled(
+    screenshots.map(async (screenshot, i) => {
+      const base64 = screenshot.imageBytes.toString("base64");
+      console.log(`  Extracting screenshot ${i + 1}/${screenshots.length}...`);
+      return analyzeOrderScreenshot(base64, screenshot.mediaContentType);
+    })
+  );
 
-  console.log(`Extracted data:`, extractedData);
+  // Merge results from all screenshots
+  const allItems: any[] = [];
+  let trackingNumber: string | null = null;
+  let orderNumber: string | null = null;
+  let seller: string | null = null;
+  let orderDate: string | null = null;
+  let shippingCarrier: string | null = null;
 
-  // Calculate total pieces from items
-  const totalPieces = extractedData.items?.reduce((sum: number, item: any) => sum + (item.quantity || 0), 0) || 0;
+  for (let i = 0; i < extractionResults.length; i++) {
+    const result = extractionResults[i];
+    if (result.status === "fulfilled") {
+      const data = result.value;
+      if (data.items && data.items.length > 0) {
+        allItems.push(...data.items);
+      }
+      // Fill in metadata from first screenshot that has it
+      if (!trackingNumber && data.trackingNumber) trackingNumber = data.trackingNumber;
+      if (!orderNumber && data.orderNumber) orderNumber = data.orderNumber;
+      if (!seller && data.seller) seller = data.seller;
+      if (!orderDate && data.orderDate) orderDate = data.orderDate;
+      if (!shippingCarrier && data.shippingCarrier) shippingCarrier = data.shippingCarrier;
+
+      console.log(`  Screenshot ${i + 1}: ${data.items?.length || 0} items, $${data.orderTotal || 0}`);
+    } else {
+      console.warn(`  Screenshot ${i + 1} extraction failed:`, result.reason);
+    }
+  }
+
+  // Calculate totals from merged items (more accurate than summing orderTotals)
+  const totalPieces = allItems.reduce((sum: number, item: any) => sum + (item.quantity || 0), 0);
+  const totalValue = allItems.reduce((sum: number, item: any) => sum + (item.totalValue || 0), 0);
+  const allCarriers = new Set<string>();
+  if (shippingCarrier) allCarriers.add(shippingCarrier);
+
+  console.log(`Merged: ${allItems.length} total items, ${totalPieces} pieces, $${totalValue.toFixed(2)}`);
 
   // Get next sequential package number
   const packageNumber = await getNextPackageNumber(user.organizationId);
@@ -206,16 +240,16 @@ async function processMultipleScreenshots(
     // OrderManagement table fields
     packageNumber: packageNumber, // Sequential: Paquete #29, #30, etc.
     date: new Date().toISOString().split("T")[0], // Upload date (today), not order date from screenshot
-    consignee: customerName, // Customer name
+    consignee: customerName.trim(), // Customer name
     pieces: totalPieces, // Total item count
     weight: "", // Empty for now (not extracted from screenshots)
-    trackingNumber: extractedData.trackingNumber || "",
-    merchantTrackingNumber: extractedData.trackingNumber || "",
-    orderNumber: extractedData.orderNumber || "",
-    company: extractedData.seller || "", // Seller/Store name
-    value: extractedData.orderTotal || 0, // Order total
-    parcelComp: extractedData.shippingCarrier || "", // Shipping carrier from AI
-    carriers: extractedData.shippingCarrier ? [extractedData.shippingCarrier] : [], // Array format
+    trackingNumber: trackingNumber || "",
+    merchantTrackingNumber: trackingNumber || "",
+    orderNumber: orderNumber || "",
+    company: seller || "", // Seller/Store name
+    value: totalValue, // Sum of all item values across all screenshots
+    parcelComp: shippingCarrier || "", // Shipping carrier from AI
+    carriers: allCarriers.size > 0 ? [...allCarriers] : [], // Array format
     screenshotUrls: downloadUrls, // ALL screenshot URLs from this message
 
     // Additional metadata (not in OrderRow but useful)
@@ -224,8 +258,8 @@ async function processMultipleScreenshots(
     uploadedBy: user.id,
     uploadedByName: user.displayName || user.email,
     imagePath: storagePaths[0], // Primary image path
-    imageType: firstScreenshot.mediaContentType,
-    items: extractedData.items || [], // Keep item details
+    imageType: screenshots[0].mediaContentType,
+    items: allItems, // ALL items from ALL screenshots
     status: "pending-review",
     extractionStatus: "completed",
     source: "whatsapp",
@@ -244,8 +278,8 @@ async function processMultipleScreenshots(
   console.log(`Order created: ${orderRef.id} with ${screenshots.length} screenshots`);
 
   // Send success message
-  const itemsSummary = extractedData.items?.length > 0 ?
-    extractedData.items.map((item: any) =>
+  const itemsSummary = allItems.length > 0 ?
+    allItems.map((item: any) =>
       `• ${item.name} (${item.quantity}x) - $${item.totalValue.toFixed(2)}`
     ).join("\n") :
     "No items extracted";
@@ -253,9 +287,9 @@ async function processMultipleScreenshots(
   await sendWhatsAppMessage(
     senderPhone,
     `✅ Order created for ${customerName}\n\n` +
-    `📸 ${screenshots.length} screenshot${screenshots.length > 1 ? "s" : ""} attached\n\n` +
+    `📸 ${screenshots.length} screenshot${screenshots.length > 1 ? "s" : ""} analyzed → ${allItems.length} items found\n\n` +
     `${itemsSummary}\n\n` +
-    `Total: $${extractedData.orderTotal?.toFixed(2) || "0.00"}\n\n` +
+    `Total: $${totalValue.toFixed(2)}\n\n` +
     `📱 Review in ImportFlow app\n` +
     `Status: Pending Review\n\n` +
     `Send more screenshots for ${customerName} or send a new customer name.`
@@ -268,8 +302,8 @@ async function processMultipleScreenshots(
  */
 export const twilioWhatsAppWebhook = onRequest(
   {
-    timeoutSeconds: 60,
-    memory: "512MiB",
+    timeoutSeconds: 300,
+    memory: "1GiB",
     invoker: "public",
   },
   async (req, res) => {

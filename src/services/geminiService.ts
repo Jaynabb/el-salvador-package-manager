@@ -656,8 +656,9 @@ Return this EXACT JSON format:
   "carriers": ["USPS", "FedEx"] or [] or null,
   "items": [
     {
-      "name": "item name",
+      "name": "full product name as shown on screenshot",
       "description": "item description",
+      "customsDescription": "SHORT customs description in Spanish (3-5 words max): item type + color ONLY. NO brand names, NO marketing text, NO sizes. Examples: 'Calzoncillos Boxer Negro', 'Vestido Rojo Mujer', 'Consola Juegos Portátil', 'Camiseta Blanca Mujer', 'Zapatos Deportivos Negros'. If screenshot is in English, translate to Spanish.",
       "quantity": number,
       "unitValue": number,
       "totalValue": number,
@@ -977,6 +978,99 @@ Return ONLY valid JSON, no markdown, no extra text.`;
   }, null, 2));
 
   return extractedData;
+};
+
+/**
+ * Extract order items from Word document text.
+ * Used when a customer sends a Word doc listing their items.
+ */
+export const extractItemsFromDocText = async (docText: string, customerName?: string): Promise<{
+  customers: Array<{
+    name: string;
+    items: PackageItem[];
+    orderTotal: number;
+    totalPieces: number;
+  }>;
+}> => {
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.5-flash',
+    generationConfig: { temperature: 0.1, topP: 0.95, topK: 40, candidateCount: 1 },
+  });
+
+  const prompt = `You are extracting item data from a Word document for El Salvador customs declarations.
+
+The document contains a list of items that a customer is importing. Extract ALL items with their details.
+
+RULES:
+- Extract EVERY item mentioned in the document
+- For each item: name, quantity, unit price, total price, category
+- If the document lists multiple customers/consignees, group items by customer
+- If no customer name is found in the document, use "${customerName || 'Unknown'}" as the customer name
+- Prices should be in USD. If no currency specified, assume USD.
+- Quantity defaults to 1 if not specified
+- Calculate totalValue = quantity × unitValue
+- Generate a SHORT Spanish customs description for each item (3-5 words: item type + color only)
+- Category: electronics, clothing, toys, food, accessories, cosmetics, footwear, home goods, other
+
+Return this EXACT JSON format:
+{
+  "customers": [
+    {
+      "name": "Customer Name",
+      "items": [
+        {
+          "name": "full item name from document",
+          "customsDescription": "Short Spanish customs description (e.g., 'Calzoncillos Boxer Negro')",
+          "quantity": 1,
+          "unitValue": 10.00,
+          "totalValue": 10.00,
+          "category": "clothing"
+        }
+      ],
+      "orderTotal": 100.00,
+      "totalPieces": 10
+    }
+  ]
+}
+
+Return ONLY valid JSON.
+
+DOCUMENT TEXT:
+${docText}`;
+
+  const result = await model.generateContent(prompt);
+  const responseText = result.response.text();
+
+  let jsonText = responseText;
+  if (jsonText.includes('```json')) {
+    jsonText = jsonText.split('```json')[1].split('```')[0].trim();
+  } else if (jsonText.includes('```')) {
+    jsonText = jsonText.split('```')[1].split('```')[0].trim();
+  }
+
+  const parsed = JSON.parse(jsonText);
+
+  // Ensure structure
+  if (!parsed.customers || !Array.isArray(parsed.customers)) {
+    return { customers: [{ name: customerName || 'Unknown', items: [], orderTotal: 0, totalPieces: 0 }] };
+  }
+
+  for (const customer of parsed.customers) {
+    if (!customer.items) customer.items = [];
+    customer.items = customer.items.map((item: any) => ({
+      name: item.name || 'Unknown Item',
+      customsDescription: item.customsDescription || null,
+      description: item.description || null,
+      quantity: item.quantity || 1,
+      unitValue: item.unitValue || 0,
+      totalValue: item.totalValue || (item.unitValue || 0) * (item.quantity || 1),
+      category: item.category || 'other',
+    }));
+    customer.totalPieces = customer.items.reduce((s: number, i: any) => s + (i.quantity || 0), 0);
+    customer.orderTotal = customer.items.reduce((s: number, i: any) => s + (i.totalValue || 0), 0);
+  }
+
+  return parsed;
 };
 
 /**

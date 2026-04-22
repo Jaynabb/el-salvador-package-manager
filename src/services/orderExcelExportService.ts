@@ -1,32 +1,287 @@
-import ExcelJS from 'exceljs';
-import * as JSZip from 'jszip';
+import { doc, getDoc, collection, addDoc } from 'firebase/firestore';
+import { db } from './firebase';
+import { getValidAccessToken } from './orderExportService';
 import type { OrderRow } from '../components/OrderManagement';
+import type { Organization } from '../types';
 
 /**
- * Desarrollo Excel Export Service
- * Builds the customs CONTROL sheet from scratch to match the Google Sheet reference format.
- * Columns C-K, Calibri 13pt, full grid borders, formulas for TOTAL/SUBTOTAL/Grand TOTAL,
- * pagination keeping whole customers together, page indicators, and signature blocks.
+ * Desarrollo Google Sheets Export Service
+ * Creates a Google Sheet in the CONTROL format for customs submission.
+ * Each page of the form is a separate sheet tab ("Hoja 1", "Hoja 2", etc.)
+ * so that each page prints cleanly without bleeding into the next.
  */
 
-// ── Style constants ──────────────────────────────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────────────────
 
-const FONT: Partial<ExcelJS.Font> = { name: 'Calibri', size: 13, color: { argb: 'FF000000' } };
-const FONT_BOLD: Partial<ExcelJS.Font> = { ...FONT, bold: true };
-const CURRENCY_FORMAT = '"$"#,##0.00';
+const ROWS_PER_PAGE = 68;
+const OVERHEAD_ROWS = 15; // title(7) + blank(1) + headers(2) + subtotal(1) + blank(2) + sig(2)
+const GRID_ROWS_PER_PAGE = ROWS_PER_PAGE - OVERHEAD_ROWS; // 53
 
-// Border matching reference: thin black (argb FF000000)
-const TB: Partial<ExcelJS.Border> = { style: 'thin', color: { argb: 'FF000000' } };
+// The SUBTOTAL row is always at the same 0-indexed position on every sheet:
+// title(7) + blank(1) + headers(2) + grid(53) = row 63  → A1 row 64
+const SUBTOTAL_ROW_0 = 63;
+const SUBTOTAL_ROW_A1 = SUBTOTAL_ROW_0 + 1; // 64
 
-// Full grid border for all data cells C-K
-const CELL_BORDER: Partial<ExcelJS.Borders> = { left: TB, right: TB, top: TB, bottom: TB };
+// Column widths in pixels
+const COLUMN_WIDTHS_PX: Record<number, number> = {
+  0: 70,   // A
+  1: 21,   // B
+  2: 192,  // C — Consignatario
+  3: 113,  // D — No de PK
+  4: 43,   // E — Cant.
+  5: 410,  // F — Descripcion
+  6: 71,   // G — Usado
+  7: 119,  // H — Nuevo
+  8: 96,   // I — Valor Unit.
+  9: 168,  // J — Total
+  10: 70,  // K — IVA
+};
 
-const ROW_HEIGHT = 15.75;
-const MAX_DATA_ROWS_PER_PAGE = 60;
+const ROW_HEIGHT_PX = 21;
 
-const COLUMN_WIDTHS: Record<string, number> = {
-  A: 8.71, B: 2.14, C: 24.86, D: 14.43, E: 5, F: 54,
-  G: 8.86, H: 15.14, I: 12.14, J: 21.71, K: 8.71,
+// Google Sheets formatting constants
+const SOLID_BLACK = {
+  style: 'SOLID' as const,
+  colorStyle: { rgbColor: { red: 0, green: 0, blue: 0 } },
+};
+
+const ALL_BORDERS = {
+  top: SOLID_BLACK,
+  bottom: SOLID_BLACK,
+  left: SOLID_BLACK,
+  right: SOLID_BLACK,
+};
+
+const FONT_NORMAL = {
+  fontFamily: 'Calibri',
+  fontSize: 11,
+  foregroundColorStyle: { rgbColor: { red: 0, green: 0, blue: 0 } },
+};
+
+const FONT_BOLD = { ...FONT_NORMAL, bold: true };
+
+const CURRENCY_FORMAT = { type: 'NUMBER' as const, pattern: '"$"#,##0.00' };
+
+// ── English → Spanish translation for item descriptions ─────────────────────
+
+const PHRASE_MAP: Record<string, string> = {
+  // Multi-word phrases (matched first, longest first)
+  'SCREEN PROTECTOR': 'PROTECTOR DE PANTALLA',
+  'PHONE CASE': 'FUNDA DE TELÉFONO',
+  'CELL PHONE': 'TELÉFONO CELULAR',
+  'SMART WATCH': 'RELOJ INTELIGENTE',
+  'SMART PHONE': 'TELÉFONO INTELIGENTE',
+  'POWER BANK': 'BATERÍA PORTÁTIL',
+  'MEMORY CARD': 'TARJETA DE MEMORIA',
+  'FLASH DRIVE': 'MEMORIA USB',
+  'HARD DRIVE': 'DISCO DURO',
+  'HOME GOODS': 'ARTÍCULOS PARA EL HOGAR',
+  'STUFFED ANIMAL': 'PELUCHE',
+  'ACTION FIGURE': 'FIGURA DE ACCIÓN',
+  'HAIR DRYER': 'SECADORA DE CABELLO',
+  'CURLING IRON': 'RIZADOR DE CABELLO',
+  'FLAT IRON': 'PLANCHA DE CABELLO',
+  'NAIL POLISH': 'ESMALTE DE UÑAS',
+  'BABY CLOTHES': 'ROPA DE BEBÉ',
+  'BABY SHOES': 'ZAPATOS DE BEBÉ',
+  'RUNNING SHOES': 'ZAPATOS PARA CORRER',
+  'HIGH HEELS': 'TACONES ALTOS',
+  'FLIP FLOPS': 'CHANCLETAS',
+  'SWIM SUIT': 'TRAJE DE BAÑO',
+  'SWIMSUIT': 'TRAJE DE BAÑO',
+  'BATHING SUIT': 'TRAJE DE BAÑO',
+  'TANK TOP': 'CAMISETA SIN MANGAS',
+  'LONG SLEEVE': 'MANGA LARGA',
+  'SHORT SLEEVE': 'MANGA CORTA',
+  'NO ITEM DETAILS': 'SIN DETALLES DE ARTÍCULO',
+  'STAINLESS STEEL': 'ACERO INOXIDABLE',
+  'ESSENTIAL OIL': 'ACEITE ESENCIAL',
+  'WATER BOTTLE': 'BOTELLA DE AGUA',
+  'TRAVEL BAG': 'BOLSA DE VIAJE',
+  'FANNY PACK': 'CANGURO',
+  'MAKE UP': 'MAQUILLAJE',
+  'MAKEUP': 'MAQUILLAJE',
+  'SKIN CARE': 'CUIDADO DE PIEL',
+  'SKINCARE': 'CUIDADO DE PIEL',
+  'HAIR CLIP': 'PINZA DE CABELLO',
+  'HAIR TIE': 'LIGA DE CABELLO',
+  'GIFT SET': 'SET DE REGALO',
+  'TOY SET': 'SET DE JUGUETE',
+  'TOOL SET': 'SET DE HERRAMIENTAS',
+  'BED SHEET': 'SÁBANA',
+  'BED SHEETS': 'SÁBANAS',
+  'PILLOW CASE': 'FUNDA DE ALMOHADA',
+  'SHOWER CURTAIN': 'CORTINA DE BAÑO',
+  'CUTTING BOARD': 'TABLA DE CORTAR',
+  'FRYING PAN': 'SARTÉN',
+  'COFFEE MUG': 'TAZA DE CAFÉ',
+  'WINE GLASS': 'COPA DE VINO',
+  'LED LIGHT': 'LUZ LED',
+  'LED LIGHTS': 'LUCES LED',
+  'FAIRY LIGHTS': 'LUCES DECORATIVAS',
+  'PACKING TAPE': 'CINTA DE EMBALAJE',
+  'DUCT TAPE': 'CINTA ADHESIVA',
+  'EXTENSION CORD': 'CABLE DE EXTENSIÓN',
+  'SURGE PROTECTOR': 'PROTECTOR DE VOLTAJE',
+  'CAR CHARGER': 'CARGADOR DE AUTO',
+  'WALL CHARGER': 'CARGADOR DE PARED',
+  'WIRELESS CHARGER': 'CARGADOR INALÁMBRICO',
+  'EAR BUDS': 'AUDÍFONOS',
+  'EARBUDS': 'AUDÍFONOS',
+  'EAR PODS': 'AUDÍFONOS',
+  'HEAD PHONES': 'AUDÍFONOS',
+  'HEADPHONES': 'AUDÍFONOS',
+  'BLUETOOTH SPEAKER': 'BOCINA BLUETOOTH',
+  'PORTABLE SPEAKER': 'BOCINA PORTÁTIL',
+};
+
+const WORD_MAP: Record<string, string> = {
+  // Electronics
+  'PHONE': 'TELÉFONO', 'LAPTOP': 'LAPTOP', 'TABLET': 'TABLETA',
+  'COMPUTER': 'COMPUTADORA', 'CHARGER': 'CARGADOR', 'CABLE': 'CABLE',
+  'ADAPTER': 'ADAPTADOR', 'BATTERY': 'BATERÍA', 'SPEAKER': 'BOCINA',
+  'CAMERA': 'CÁMARA', 'MONITOR': 'MONITOR', 'KEYBOARD': 'TECLADO',
+  'MOUSE': 'RATÓN', 'PRINTER': 'IMPRESORA', 'SCANNER': 'ESCÁNER',
+  'ROUTER': 'ROUTER', 'MODEM': 'MODEM', 'MICROPHONE': 'MICRÓFONO',
+  'HEADSET': 'AUDÍFONOS', 'CONTROLLER': 'CONTROL', 'CONSOLE': 'CONSOLA',
+  'REMOTE': 'CONTROL REMOTO', 'STYLUS': 'LÁPIZ DIGITAL',
+  'TRIPOD': 'TRÍPODE', 'DRONE': 'DRON', 'PROJECTOR': 'PROYECTOR',
+  // Clothing
+  'SHIRT': 'CAMISA', 'T-SHIRT': 'CAMISETA', 'TSHIRT': 'CAMISETA',
+  'PANTS': 'PANTALONES', 'JEANS': 'JEANS', 'DRESS': 'VESTIDO',
+  'JACKET': 'CHAQUETA', 'COAT': 'ABRIGO', 'SWEATER': 'SUÉTER',
+  'HOODIE': 'SUDADERA', 'SHORTS': 'PANTALONES CORTOS', 'SKIRT': 'FALDA',
+  'BLOUSE': 'BLUSA', 'SUIT': 'TRAJE', 'VEST': 'CHALECO',
+  'LEGGINGS': 'LEGGINGS', 'PAJAMAS': 'PIJAMAS', 'ROBE': 'BATA',
+  'UNIFORM': 'UNIFORME', 'COSTUME': 'DISFRAZ', 'SCARF': 'BUFANDA',
+  'GLOVES': 'GUANTES', 'TIE': 'CORBATA', 'APRON': 'DELANTAL',
+  // Underwear
+  'UNDERWEAR': 'ROPA INTERIOR', 'BRAS': 'SOSTENES', 'BRA': 'SOSTÉN',
+  'SOCKS': 'CALCETINES', 'BOXERS': 'BÓXERS', 'BRIEFS': 'CALZONCILLOS',
+  'PANTIES': 'PANTALETAS', 'THONG': 'TANGA',
+  // Shoes
+  'SHOES': 'ZAPATOS', 'SNEAKERS': 'TENIS', 'BOOTS': 'BOTAS',
+  'SANDALS': 'SANDALIAS', 'HEELS': 'TACONES', 'FLATS': 'ZAPATOS BAJOS',
+  'SLIPPERS': 'PANTUFLAS', 'LOAFERS': 'MOCASINES', 'CLEATS': 'TACOS',
+  // Accessories
+  'WATCH': 'RELOJ', 'WATCHES': 'RELOJES', 'SUNGLASSES': 'LENTES DE SOL',
+  'GLASSES': 'LENTES', 'BELT': 'CINTURÓN', 'BELTS': 'CINTURONES',
+  'WALLET': 'CARTERA', 'PURSE': 'BOLSO', 'BAG': 'BOLSA',
+  'BAGS': 'BOLSAS', 'BACKPACK': 'MOCHILA', 'HAT': 'SOMBRERO',
+  'HATS': 'SOMBREROS', 'CAP': 'GORRA', 'JEWELRY': 'JOYERÍA',
+  'NECKLACE': 'COLLAR', 'BRACELET': 'PULSERA', 'EARRINGS': 'ARETES',
+  'RING': 'ANILLO', 'RINGS': 'ANILLOS', 'PENDANT': 'DIJE',
+  'CHAIN': 'CADENA', 'CHAINS': 'CADENAS', 'BROOCH': 'BROCHE',
+  // Home & Kitchen
+  'PILLOW': 'ALMOHADA', 'BLANKET': 'COBIJA', 'TOWEL': 'TOALLA',
+  'TOWELS': 'TOALLAS', 'CURTAIN': 'CORTINA', 'CURTAINS': 'CORTINAS',
+  'RUG': 'ALFOMBRA', 'MAT': 'TAPETE', 'LAMP': 'LÁMPARA',
+  'CANDLE': 'VELA', 'CANDLES': 'VELAS', 'PLATE': 'PLATO',
+  'PLATES': 'PLATOS', 'CUP': 'TAZA', 'CUPS': 'TAZAS',
+  'BOWL': 'TAZÓN', 'BOWLS': 'TAZONES', 'POT': 'OLLA',
+  'PAN': 'SARTÉN', 'UTENSILS': 'UTENSILIOS', 'KNIFE': 'CUCHILLO',
+  'KNIVES': 'CUCHILLOS', 'FORK': 'TENEDOR', 'SPOON': 'CUCHARA',
+  'CONTAINER': 'RECIPIENTE', 'ORGANIZER': 'ORGANIZADOR', 'SHELF': 'ESTANTE',
+  'BASKET': 'CANASTA', 'VASE': 'FLORERO', 'FRAME': 'MARCO',
+  'MIRROR': 'ESPEJO', 'CLOCK': 'RELOJ', 'THERMOMETER': 'TERMÓMETRO',
+  'FAN': 'VENTILADOR', 'IRON': 'PLANCHA', 'BLENDER': 'LICUADORA',
+  'MIXER': 'BATIDORA', 'TOASTER': 'TOSTADORA',
+  // Beauty & Cosmetics
+  'LIPSTICK': 'LABIAL', 'FOUNDATION': 'BASE', 'MASCARA': 'RÍMEL',
+  'PERFUME': 'PERFUME', 'COLOGNE': 'COLONIA', 'LOTION': 'LOCIÓN',
+  'CREAM': 'CREMA', 'SHAMPOO': 'CHAMPÚ', 'CONDITIONER': 'ACONDICIONADOR',
+  'SOAP': 'JABÓN', 'BRUSH': 'CEPILLO', 'BRUSHES': 'CEPILLOS',
+  'DEODORANT': 'DESODORANTE', 'SUNSCREEN': 'PROTECTOR SOLAR',
+  'MOISTURIZER': 'HUMECTANTE', 'SERUM': 'SÉRUM', 'TONER': 'TÓNICO',
+  'CLEANSER': 'LIMPIADOR', 'EXFOLIATOR': 'EXFOLIANTE',
+  // Toys & Games
+  'TOY': 'JUGUETE', 'TOYS': 'JUGUETES', 'DOLL': 'MUÑECA',
+  'DOLLS': 'MUÑECAS', 'PUZZLE': 'ROMPECABEZAS', 'GAME': 'JUEGO',
+  'GAMES': 'JUEGOS', 'BALL': 'PELOTA', 'BLOCKS': 'BLOQUES',
+  'CARDS': 'CARTAS', 'DICE': 'DADOS', 'STICKERS': 'CALCOMANÍAS',
+  // Food & Drinks
+  'CHOCOLATE': 'CHOCOLATE', 'CANDY': 'DULCES', 'SNACKS': 'BOCADILLOS',
+  'COFFEE': 'CAFÉ', 'TEA': 'TÉ', 'SPICES': 'ESPECIAS',
+  'SAUCE': 'SALSA', 'CEREAL': 'CEREAL', 'COOKIES': 'GALLETAS',
+  'VITAMINS': 'VITAMINAS', 'SUPPLEMENTS': 'SUPLEMENTOS',
+  'PROTEIN': 'PROTEÍNA',
+  // Tools & Hardware
+  'TOOLS': 'HERRAMIENTAS', 'TOOL': 'HERRAMIENTA', 'DRILL': 'TALADRO',
+  'HAMMER': 'MARTILLO', 'SCREWDRIVER': 'DESTORNILLADOR', 'WRENCH': 'LLAVE',
+  'PLIERS': 'PINZAS', 'TAPE': 'CINTA', 'GLUE': 'PEGAMENTO',
+  'SCISSORS': 'TIJERAS', 'MEASURING': 'MEDICIÓN', 'LEVEL': 'NIVEL',
+  // Materials / Adjectives
+  'COTTON': 'ALGODÓN', 'LEATHER': 'CUERO', 'PLASTIC': 'PLÁSTICO',
+  'METAL': 'METAL', 'RUBBER': 'CAUCHO', 'WOODEN': 'MADERA',
+  'WOOD': 'MADERA', 'GLASS': 'VIDRIO', 'CERAMIC': 'CERÁMICA',
+  'SILK': 'SEDA', 'WOOL': 'LANA', 'NYLON': 'NYLON', 'LINEN': 'LINO',
+  'VELVET': 'TERCIOPELO', 'DENIM': 'MEZCLILLA', 'POLYESTER': 'POLIÉSTER',
+  'PORTABLE': 'PORTÁTIL', 'WIRELESS': 'INALÁMBRICO', 'WATERPROOF': 'IMPERMEABLE',
+  'RECHARGEABLE': 'RECARGABLE', 'ADJUSTABLE': 'AJUSTABLE', 'FOLDABLE': 'PLEGABLE',
+  'MAGNETIC': 'MAGNÉTICO', 'AUTOMATIC': 'AUTOMÁTICO', 'DIGITAL': 'DIGITAL',
+  'ELECTRIC': 'ELÉCTRICO', 'ELECTRONIC': 'ELECTRÓNICO',
+  'MINI': 'MINI', 'LARGE': 'GRANDE', 'SMALL': 'PEQUEÑO', 'MEDIUM': 'MEDIANO',
+  // General terms
+  'SET': 'SET', 'PACK': 'PAQUETE', 'PAIR': 'PAR', 'PIECE': 'PIEZA',
+  'PIECES': 'PIEZAS', 'BOX': 'CAJA', 'KIT': 'KIT', 'CASE': 'FUNDA',
+  'COVER': 'FUNDA', 'HOLDER': 'SOPORTE', 'STAND': 'SOPORTE',
+  'MOUNT': 'MONTAJE', 'RACK': 'ESTANTE', 'HOOK': 'GANCHO',
+  'STRAP': 'CORREA', 'BAND': 'BANDA', 'CLIP': 'CLIP',
+  // People / Sizes
+  'MEN': 'HOMBRES', "MEN'S": 'DE HOMBRE', 'WOMEN': 'MUJERES',
+  "WOMEN'S": 'DE MUJER', 'KIDS': 'NIÑOS', "KID'S": 'DE NIÑO',
+  'CHILDREN': 'NIÑOS', "CHILDREN'S": 'DE NIÑOS',
+  'BABY': 'BEBÉ', 'INFANT': 'INFANTIL', 'TODDLER': 'NIÑO PEQUEÑO',
+  'BOYS': 'NIÑOS', 'GIRLS': 'NIÑAS', 'UNISEX': 'UNISEX',
+  // Colors
+  'BLACK': 'NEGRO', 'WHITE': 'BLANCO', 'RED': 'ROJO', 'BLUE': 'AZUL',
+  'GREEN': 'VERDE', 'YELLOW': 'AMARILLO', 'PINK': 'ROSA',
+  'PURPLE': 'MORADO', 'ORANGE': 'NARANJA', 'BROWN': 'CAFÉ',
+  'GRAY': 'GRIS', 'GREY': 'GRIS', 'GOLD': 'DORADO', 'SILVER': 'PLATEADO',
+  'BEIGE': 'BEIGE', 'NAVY': 'AZUL MARINO', 'TEAL': 'VERDE AZULADO',
+  // Misc
+  'NEW': 'NUEVO', 'USED': 'USADO', 'REPLACEMENT': 'REPUESTO',
+  'ACCESSORIES': 'ACCESORIOS', 'ACCESSORY': 'ACCESORIO',
+  'ELECTRONICS': 'ELECTRÓNICOS', 'CLOTHING': 'ROPA',
+  'COSMETICS': 'COSMÉTICOS', 'FOOD': 'ALIMENTOS',
+  'BOOKS': 'LIBROS', 'BOOK': 'LIBRO', 'MEDICINE': 'MEDICINA',
+  'SIZE': 'TALLA', 'COLOR': 'COLOR', 'STYLE': 'ESTILO',
+  'TYPE': 'TIPO', 'MODEL': 'MODELO', 'BRAND': 'MARCA',
+  'WITH': 'CON', 'FOR': 'PARA', 'AND': 'Y', 'OR': 'O',
+  'THE': 'EL', 'OF': 'DE', 'IN': 'EN',
+};
+
+// Sort phrases longest-first for greedy matching
+const SORTED_PHRASES = Object.keys(PHRASE_MAP).sort((a, b) => b.length - a.length);
+
+// Words to filter out of descriptions (inappropriate for customs forms)
+const FLAGGED_WORDS = new Set(['SEXY', 'EROTIC', 'ADULT', 'SENSUAL', 'PROVOCATIVE', 'SEDUCTIVE']);
+
+/**
+ * Translate an item description from English to Spanish.
+ * Uses phrase matching first (longest match wins), then word-by-word.
+ * Brand names, numbers, and unrecognized words pass through unchanged.
+ */
+const translateToSpanish = (text: string): string => {
+  let upper = text.toUpperCase();
+
+  // Filter out flagged words
+  for (const word of FLAGGED_WORDS) {
+    upper = upper.replace(new RegExp(`\\b${word}\\b`, 'g'), '');
+  }
+  upper = upper.replace(/\s{2,}/g, ' ').trim();
+
+  // Phase 1: Replace known multi-word phrases
+  for (const phrase of SORTED_PHRASES) {
+    const regex = new RegExp(`\\b${phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
+    upper = upper.replace(regex, PHRASE_MAP[phrase]);
+  }
+
+  // Phase 2: Replace remaining individual English words
+  upper = upper.replace(/[A-ZÀ-Ú'-]+/g, (word) => WORD_MAP[word] || word);
+
+  // Convert to title case (capitalize first letter of each word)
+  return upper.toLowerCase().replace(/(?:^|\s)\S/g, (c) => c.toUpperCase());
 };
 
 // ── Data structures ──────────────────────────────────────────────────────────
@@ -39,23 +294,6 @@ interface CustomerBlock {
   totalValue: number;
 }
 
-// ── Helper: apply grid borders to columns C-K on a row ───────────────────────
-
-const applyGridBorders = (ws: ExcelJS.Worksheet, rowNum: number) => {
-  for (const col of ['C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K']) {
-    ws.getCell(`${col}${rowNum}`).border = { ...CELL_BORDER };
-  }
-};
-
-// ── Helper: apply SUBTOTAL row borders (H/J special pattern) ─────────────────
-
-const applySubtotalBorders = (ws: ExcelJS.Worksheet, rowNum: number) => {
-  // Only H, I, J get borders — C-G and K are empty/borderless (per PDF reference)
-  ws.getCell(`H${rowNum}`).border = { left: TB, top: TB, bottom: TB };
-  ws.getCell(`I${rowNum}`).border = { ...CELL_BORDER };
-  ws.getCell(`J${rowNum}`).border = { right: TB, top: TB, bottom: TB };
-};
-
 // ── Build customer blocks from orders ────────────────────────────────────────
 
 const buildCustomerBlocks = (orders: OrderRow[]): CustomerBlock[] => {
@@ -66,10 +304,13 @@ const buildCustomerBlocks = (orders: OrderRow[]): CustomerBlock[] => {
   });
 
   return sorted.map(order => {
+    // Extract just the number from "Paquete #1" → "1"
+    const pkgNum = (order.packageNumber || '').replace(/\D+/g, '') || order.packageNumber || '';
+
     if (!order.items || order.items.length === 0) {
       return {
-        consignee: (order.consignee || '').toUpperCase(),
-        packageNumber: order.packageNumber || '',
+        consignee: (order.consignee || '').trim().toUpperCase(),
+        packageNumber: pkgNum,
         items: [{
           quantity: order.pieces || 0,
           description: 'NO ITEM DETAILS',
@@ -83,7 +324,7 @@ const buildCustomerBlocks = (orders: OrderRow[]): CustomerBlock[] => {
 
     const items = order.items.map(item => ({
       quantity: item.quantity || 0,
-      description: (item.name + (item.description ? ' - ' + item.description : '')).toUpperCase(),
+      description: item.customsDescription || translateToSpanish(item.name || 'Item'),
       unitValue: item.unitValue || 0,
       totalValue: item.totalValue || 0,
     }));
@@ -95,13 +336,13 @@ const buildCustomerBlocks = (orders: OrderRow[]): CustomerBlock[] => {
       ? order.pieces
       : totalItemQuantity;
 
-    const totalValue = Math.abs(itemsTotal - (order.value || 0)) > 0.01
-      ? (order.value || 0)
-      : itemsTotal;
+    // Always use order.value (same as Machote) — this is the OCR/manual total
+    // and is the authoritative value. Don't recalculate from items.
+    const totalValue = order.value || 0;
 
     return {
-      consignee: (order.consignee || '').toUpperCase(),
-      packageNumber: order.packageNumber || '',
+      consignee: (order.consignee || '').trim().toUpperCase(),
+      packageNumber: pkgNum,
       items,
       totalQuantity,
       totalValue,
@@ -109,7 +350,7 @@ const buildCustomerBlocks = (orders: OrderRow[]): CustomerBlock[] => {
   });
 };
 
-// ── Pagination: group customers into pages, never splitting a customer ───────
+// ── Pagination ───────────────────────────────────────────────────────────────
 
 const customerRowCount = (block: CustomerBlock): number =>
   block.items.length + 1 + 1; // items + TOTAL row + blank separator
@@ -121,7 +362,7 @@ const paginateCustomers = (blocks: CustomerBlock[]): CustomerBlock[][] => {
 
   for (const block of blocks) {
     const rows = customerRowCount(block);
-    if (currentPageRows + rows > MAX_DATA_ROWS_PER_PAGE && currentPage.length > 0) {
+    if (currentPageRows + rows > GRID_ROWS_PER_PAGE && currentPage.length > 0) {
       pages.push(currentPage);
       currentPage = [];
       currentPageRows = 0;
@@ -137,158 +378,464 @@ const paginateCustomers = (blocks: CustomerBlock[]): CustomerBlock[][] => {
   return pages;
 };
 
-// ── Title block (every page) ─────────────────────────────────────────────────
+// ── Google Sheets cell helpers ───────────────────────────────────────────────
 
-const writeTitleBlock = (
-  ws: ExcelJS.Worksheet,
-  startRow: number,
-  pageNum: number,
+const makeCell = (opts?: {
+  value?: string | number;
+  formula?: string;
+  bold?: boolean;
+  hAlign?: string;
+  vAlign?: string;
+  borders?: Record<string, typeof SOLID_BLACK>;
+  numberFormat?: typeof CURRENCY_FORMAT;
+  wrapText?: boolean;
+  clip?: boolean;
+  textRotation?: number;
+}): Record<string, unknown> => {
+  if (!opts) return {};
+
+  const cell: Record<string, unknown> = {};
+  const fmt: Record<string, unknown> = {};
+
+  // Value
+  if (opts.formula) {
+    cell.userEnteredValue = { formulaValue: opts.formula };
+  } else if (typeof opts.value === 'number') {
+    cell.userEnteredValue = { numberValue: opts.value };
+  } else if (opts.value !== undefined) {
+    cell.userEnteredValue = { stringValue: opts.value };
+  }
+
+  // Font
+  fmt.textFormat = opts.bold ? { ...FONT_BOLD } : { ...FONT_NORMAL };
+
+  // Alignment
+  fmt.horizontalAlignment = opts.hAlign || 'LEFT';
+  fmt.verticalAlignment = opts.vAlign || 'BOTTOM';
+  if (opts.wrapText) fmt.wrapStrategy = 'WRAP';
+  else if (opts.clip) fmt.wrapStrategy = 'CLIP';
+  if (opts.textRotation) fmt.textRotation = { angle: opts.textRotation };
+
+  // Borders
+  if (opts.borders) fmt.borders = opts.borders;
+
+  // Number format
+  if (opts.numberFormat) fmt.numberFormat = opts.numberFormat;
+
+  cell.userEnteredFormat = fmt;
+  return cell;
+};
+
+const emptyRow = (): Record<string, unknown> => ({
+  values: Array.from({ length: 11 }, () => ({})),
+});
+
+const makeRow = (cells: Record<number, Record<string, unknown>>): Record<string, unknown> => {
+  const values: Record<string, unknown>[] = [];
+  for (let col = 0; col < 11; col++) {
+    values.push(cells[col] || {});
+  }
+  return { values };
+};
+
+const emptyGridRow = (): Record<string, unknown> => {
+  const cells: Record<number, Record<string, unknown>> = {};
+  for (let col = 2; col <= 10; col++) {
+    cells[col] = makeCell({ borders: ALL_BORDERS });
+  }
+  return makeRow(cells);
+};
+
+// ── Write column headers (every page) ────────────────────────────────────────
+
+const writeHeaders = (
+  rows: Record<string, unknown>[],
+  merges: Record<string, unknown>[],
+  currentRow: number,
+  sheetId: number,
+): number => {
+  const startRow = currentRow;
+  const topOnly = { top: SOLID_BLACK, left: SOLID_BLACK, right: SOLID_BLACK };
+  const bottomOnly = { bottom: SOLID_BLACK, left: SOLID_BLACK, right: SOLID_BLACK };
+
+  // Row 1: main headers (merged vertically with row 2 for most columns)
+  rows.push(makeRow({
+    2: makeCell({ value: 'Consignatario Persona Natural', bold: true, hAlign: 'CENTER', vAlign: 'MIDDLE', wrapText: true, borders: topOnly }),
+    3: makeCell({ value: 'No de PK', bold: true, hAlign: 'CENTER', vAlign: 'MIDDLE', wrapText: true, borders: topOnly }),
+    4: makeCell({ value: 'Cant.', bold: true, hAlign: 'CENTER', vAlign: 'MIDDLE', wrapText: true, borders: topOnly, textRotation: 90 }),
+    5: makeCell({ value: 'Descripcion', bold: true, hAlign: 'CENTER', vAlign: 'MIDDLE', wrapText: true, borders: topOnly }),
+    6: makeCell({ value: 'Mercancias', bold: true, hAlign: 'CENTER', vAlign: 'MIDDLE', borders: { left: SOLID_BLACK, top: SOLID_BLACK, bottom: SOLID_BLACK } }),
+    7: makeCell({ borders: { right: SOLID_BLACK, top: SOLID_BLACK, bottom: SOLID_BLACK } }),
+    8: makeCell({ value: 'Valor Unit. $', bold: true, hAlign: 'CENTER', vAlign: 'MIDDLE', wrapText: true, borders: topOnly }),
+    9: makeCell({ value: 'Total', bold: true, hAlign: 'CENTER', vAlign: 'MIDDLE', wrapText: true, borders: topOnly }),
+    10: makeCell({ value: 'IVA o 30%', bold: true, hAlign: 'CENTER', vAlign: 'MIDDLE', wrapText: true, borders: topOnly }),
+  }));
+  currentRow++;
+
+  // Row 2: sub-headers (Usado / Nuevo) + bottom borders on merged cells
+  rows.push(makeRow({
+    2: makeCell({ borders: bottomOnly }),
+    3: makeCell({ borders: bottomOnly }),
+    4: makeCell({ borders: bottomOnly }),
+    5: makeCell({ borders: bottomOnly }),
+    6: makeCell({ value: 'Usado', hAlign: 'CENTER', wrapText: true, borders: ALL_BORDERS }),
+    7: makeCell({ value: 'Nuevo', hAlign: 'CENTER', wrapText: true, borders: ALL_BORDERS }),
+    8: makeCell({ borders: bottomOnly }),
+    9: makeCell({ borders: bottomOnly }),
+    10: makeCell({ borders: bottomOnly }),
+  }));
+  currentRow++;
+
+  // Vertical merges for C, D, E, F, I, J, K
+  for (const col of [2, 3, 4, 5, 8, 9, 10]) {
+    merges.push({
+      sheetId,
+      startRowIndex: startRow,
+      endRowIndex: startRow + 2,
+      startColumnIndex: col,
+      endColumnIndex: col + 1,
+    });
+  }
+
+  // Horizontal merge G+H on row 1
+  merges.push({
+    sheetId,
+    startRowIndex: startRow,
+    endRowIndex: startRow + 1,
+    startColumnIndex: 6,
+    endColumnIndex: 8,
+  });
+
+  return currentRow;
+};
+
+// ── Build rows for a single page/sheet ───────────────────────────────────────
+
+interface PageData {
+  rows: Record<string, unknown>[];
+  merges: Record<string, unknown>[];
+}
+
+const buildPageData = (
+  page: CustomerBlock[],
+  pageIndex: number,
   totalPages: number,
-) => {
-  // Cross-platform safe: no merges, no theme colors, no centerContinuous.
-  // All text uses explicit argb black, plain alignment.
+  sheetId: number,
+  allSheetNames: string[],
+): PageData => {
+  const rows: Record<string, unknown>[] = [];
+  const merges: Record<string, unknown>[] = [];
+  const isLastPage = pageIndex === totalPages - 1;
 
-  // Row 1: "No. de registro de mercancías:" (left) + "Gestor 3145" (right)
-  const r1 = startRow;
-  ws.getCell(`C${r1}`).value = 'No. de registro de mercancías:';
-  ws.getCell(`C${r1}`).font = { ...FONT };
-  ws.getCell(`J${r1}`).value = 'Gestor 3145';
-  ws.getCell(`J${r1}`).font = { ...FONT };
-  ws.getRow(r1).height = ROW_HEIGHT;
+  const r1 = (idx: number) => idx + 1; // 0-indexed → A1 row number
 
-  // Row 2: "Codigo de aduana: 3" (left) + "No. de hojas X de Y" (right)
-  const r2 = startRow + 1;
-  ws.getCell(`C${r2}`).value = 'Codigo de aduana: 3';
-  ws.getCell(`C${r2}`).font = { ...FONT };
-  ws.getCell(`J${r2}`).value = `No. de hojas ${pageNum} de ${totalPages}`;
-  ws.getCell(`J${r2}`).font = { ...FONT };
-  ws.getRow(r2).height = ROW_HEIGHT;
+  let currentRow = 0;
+
+  // ── Title block (7 rows) ─────────────────────────────────────────────
+
+  // Row 1: registro + Gestor
+  rows.push(makeRow({
+    2: makeCell({ value: 'No. de registro de mercancías:' }),
+    9: makeCell({ value: 'Gestor 3145' }),
+  }));
+  currentRow++;
+
+  // Row 2: codigo + hojas
+  rows.push(makeRow({
+    2: makeCell({ value: 'Codigo de aduana: 3' }),
+    9: makeCell({ value: `No. de hojas ${pageIndex + 1} de ${totalPages}` }),
+  }));
+  currentRow++;
 
   // Row 3: blank
-  ws.getRow(startRow + 2).height = ROW_HEIGHT;
+  rows.push(emptyRow());
+  currentRow++;
 
-  // Row 4: "DIRECCIÓN GENERAL DE ADUANAS" (bold, in F column — centered within the wide description column)
-  const r4 = startRow + 3;
-  ws.getCell(`F${r4}`).value = 'DIRECCIÓN GENERAL DE ADUANAS';
-  ws.getCell(`F${r4}`).font = { ...FONT_BOLD };
-  ws.getCell(`F${r4}`).alignment = { horizontal: 'center' };
-  ws.getRow(r4).height = ROW_HEIGHT;
+  // Row 4: DIRECCIÓN (centered in F)
+  rows.push(makeRow({
+    5: makeCell({ value: 'DIRECCIÓN GENERAL DE ADUANAS', bold: true, hAlign: 'CENTER' }),
+  }));
+  currentRow++;
 
-  // Row 5: "DIVISIÓN DE OPERACIONES" (bold, in F column)
-  const r5 = startRow + 4;
-  ws.getCell(`F${r5}`).value = 'DIVISIÓN DE OPERACIONES';
-  ws.getCell(`F${r5}`).font = { ...FONT_BOLD };
-  ws.getCell(`F${r5}`).alignment = { horizontal: 'center' };
-  ws.getRow(r5).height = ROW_HEIGHT;
+  // Row 5: DIVISIÓN (centered in F)
+  rows.push(makeRow({
+    5: makeCell({ value: 'DIVISIÓN DE OPERACIONES', bold: true, hAlign: 'CENTER' }),
+  }));
+  currentRow++;
 
-  // Row 6: blank (gap between DIVISIÓN and ANEXO, matching PDF)
-  ws.getRow(startRow + 5).height = ROW_HEIGHT;
+  // Row 6: blank
+  rows.push(emptyRow());
+  currentRow++;
 
-  // Row 7: ANEXO text (bold, in C column — long text overflows across empty cells)
-  const r7 = startRow + 6;
-  ws.getCell(`C${r7}`).value =
-    'ANEXO A LA DECLARACIÓN DE MERCANCÍAS PARA PEQUEÑOS ENVÍOS Y DECLARACIÓN DE EQUIPAJE';
-  ws.getCell(`C${r7}`).font = { ...FONT_BOLD };
-  ws.getRow(r7).height = ROW_HEIGHT;
-};
+  // Row 7: ANEXO (centered)
+  rows.push(makeRow({
+    5: makeCell({
+      value: 'ANEXO A LA DECLARACIÓN DE MERCANCÍAS PARA PEQUEÑOS ENVÍOS Y DECLARACIÓN DE EQUIPAJE',
+      bold: true,
+      hAlign: 'CENTER',
+    }),
+  }));
+  currentRow++;
 
-// ── Column headers (page 1 only) ────────────────────────────────────────────
+  // Row 8: blank between title and headers
+  rows.push(emptyRow());
+  currentRow++;
 
-const writeHeaders = (ws: ExcelJS.Worksheet, headerRow: number) => {
-  const row7 = headerRow;
-  const row8 = headerRow + 1;
+  // ── Column headers (2 rows) ──────────────────────────────────────────
 
-  const setHeaderCell = (
-    ref: string,
-    value: string,
-    extraAlign?: Partial<ExcelJS.Alignment>,
-    borderOverride?: Partial<ExcelJS.Borders>,
-  ) => {
-    const cell = ws.getCell(ref);
-    cell.value = value;
-    cell.font = { ...FONT_BOLD };
-    cell.alignment = {
-      horizontal: 'center',
-      vertical: 'middle',
-      wrapText: true,
-      shrinkToFit: false,
-      ...extraAlign,
+  currentRow = writeHeaders(rows, merges, currentRow, sheetId);
+
+  // ── Customer data rows ───────────────────────────────────────────────
+
+  let dataRowsWritten = 0;
+  const customerTotalJRows: number[] = [];
+
+  for (const block of page) {
+    const firstItemRow = currentRow;
+
+    for (let i = 0; i < block.items.length; i++) {
+      const item = block.items[i];
+      const cells: Record<number, Record<string, unknown>> = {};
+
+      if (i === 0) {
+        cells[2] = makeCell({ value: block.consignee, borders: ALL_BORDERS });
+        cells[3] = makeCell({ value: block.packageNumber, bold: true, borders: ALL_BORDERS });
+      } else {
+        cells[2] = makeCell({ borders: ALL_BORDERS });
+        cells[3] = makeCell({ borders: ALL_BORDERS });
+      }
+
+      cells[4] = makeCell({ value: item.quantity, borders: ALL_BORDERS });
+      cells[5] = makeCell({ value: item.description, borders: ALL_BORDERS, clip: true });
+      cells[6] = makeCell({ borders: ALL_BORDERS });
+      cells[7] = makeCell({ value: 'X', borders: ALL_BORDERS });
+      cells[8] = makeCell({ value: item.unitValue, borders: ALL_BORDERS, numberFormat: CURRENCY_FORMAT });
+      cells[9] = makeCell({ value: item.totalValue, borders: ALL_BORDERS, numberFormat: CURRENCY_FORMAT });
+      cells[10] = makeCell({ borders: ALL_BORDERS });
+
+      rows.push(makeRow(cells));
+      currentRow++;
+      dataRowsWritten++;
+    }
+
+    const lastItemRow = currentRow - 1;
+
+    // TOTAL row
+    const totalCells: Record<number, Record<string, unknown>> = {
+      2: makeCell({ borders: ALL_BORDERS }),
+      3: makeCell({ borders: ALL_BORDERS }),
+      4: makeCell({ formula: `=SUM(E${firstItemRow + 1}:E${currentRow})`, bold: true, borders: ALL_BORDERS }),
+      5: makeCell({ borders: ALL_BORDERS }),
+      6: makeCell({ borders: ALL_BORDERS }),
+      7: makeCell({ borders: ALL_BORDERS }),
+      8: makeCell({ value: 'TOTAL', bold: true, borders: ALL_BORDERS }),
+      10: makeCell({ borders: ALL_BORDERS }),
     };
-    cell.border = borderOverride ?? { left: TB, right: TB, top: TB };
-  };
 
-  setHeaderCell(`C${row7}`, 'Consignatario Persona Natural');
-  setHeaderCell(`D${row7}`, 'No de PK');
-  setHeaderCell(`E${row7}`, 'Cant.', { textRotation: 90 });
-  setHeaderCell(`F${row7}`, 'Descripcion');
-  setHeaderCell(`G${row7}`, 'Mercancias', {}, { left: TB, top: TB, bottom: TB });
-  ws.getCell(`H${row7}`).border = { right: TB, top: TB, bottom: TB };
-  setHeaderCell(`I${row7}`, 'Valor Unit. $');
-  setHeaderCell(`J${row7}`, 'Total');
-  setHeaderCell(`K${row7}`, 'IVA o 30%');
+    // SUM formula so the displayed total always matches the displayed item values.
+    totalCells[9] = makeCell({
+      formula: `=SUM(J${firstItemRow + 1}:J${currentRow})`,
+      bold: true, borders: ALL_BORDERS, numberFormat: CURRENCY_FORMAT,
+    });
 
-  // Row 8: sub-headers for G/H + bottom borders on all merged header cells
-  for (const col of ['C', 'D', 'E', 'F', 'I', 'J', 'K']) {
-    ws.getCell(`${col}${row8}`).border = { left: TB, right: TB, bottom: TB };
+    rows.push(makeRow(totalCells));
+    customerTotalJRows.push(currentRow);
+    currentRow++;
+    dataRowsWritten++;
+
+    // Blank separator
+    rows.push(emptyGridRow());
+    currentRow++;
+    dataRowsWritten++;
   }
 
-  // G8: Usado
-  const g8 = ws.getCell(`G${row8}`);
-  g8.value = 'Usado';
-  g8.font = { ...FONT };
-  g8.alignment = { horizontal: 'center', wrapText: true, shrinkToFit: false };
-  g8.border = { ...CELL_BORDER };
+  // ── Pad remaining grid space with empty bordered rows ────────────────
 
-  // H8: Nuevo
-  const h8 = ws.getCell(`H${row8}`);
-  h8.value = 'Nuevo';
-  h8.font = { ...FONT };
-  h8.alignment = { horizontal: 'center', wrapText: true, shrinkToFit: false };
-  h8.border = { ...CELL_BORDER };
+  while (dataRowsWritten < GRID_ROWS_PER_PAGE) {
+    rows.push(emptyGridRow());
+    currentRow++;
+    dataRowsWritten++;
+  }
 
-  ws.getRow(row7).height = ROW_HEIGHT;
-  ws.getRow(row8).height = ROW_HEIGHT;
+  // ── SUBTOTAL row ─────────────────────────────────────────────────────
 
-  // Merges
-  ws.mergeCells(`C${row7}:C${row8}`);
-  ws.mergeCells(`D${row7}:D${row8}`);
-  ws.mergeCells(`E${row7}:E${row8}`);
-  ws.mergeCells(`F${row7}:F${row8}`);
-  ws.mergeCells(`G${row7}:H${row7}`);
-  ws.mergeCells(`I${row7}:I${row8}`);
-  ws.mergeCells(`J${row7}:J${row8}`);
-  ws.mergeCells(`K${row7}:K${row8}`);
+  const subtotalFormula = customerTotalJRows.length > 0
+    ? customerTotalJRows.map(r => `J${r1(r)}`).join('+')
+    : '0';
+
+  rows.push(makeRow({
+    7: makeCell({
+      value: 'SUBTOTAL', bold: true,
+      borders: { left: SOLID_BLACK, top: SOLID_BLACK, bottom: SOLID_BLACK },
+    }),
+    8: makeCell({ value: 'SUBTOTAL', bold: true, borders: ALL_BORDERS }),
+    9: makeCell({
+      formula: `=${subtotalFormula}`, bold: true,
+      borders: { right: SOLID_BLACK, top: SOLID_BLACK, bottom: SOLID_BLACK },
+      numberFormat: CURRENCY_FORMAT,
+    }),
+  }));
+  currentRow++;
+
+  // ── Grand TOTAL (last page, multi-page only) ─────────────────────────
+
+  if (isLastPage && totalPages > 1) {
+    // Reference subtotal cell (J + SUBTOTAL_ROW_A1) on every sheet
+    const grandTotalFormula = allSheetNames
+      .map(name => `'${name}'!J${SUBTOTAL_ROW_A1}`)
+      .join('+');
+
+    rows.push(makeRow({
+      8: makeCell({
+        value: 'TOTAL', bold: true,
+        borders: { left: SOLID_BLACK, top: SOLID_BLACK, bottom: SOLID_BLACK },
+      }),
+      9: makeCell({
+        formula: `=${grandTotalFormula}`, bold: true,
+        borders: { right: SOLID_BLACK, top: SOLID_BLACK, bottom: SOLID_BLACK },
+        numberFormat: CURRENCY_FORMAT,
+      }),
+    }));
+    currentRow++;
+  }
+
+  // ── Signature block (2 blank + underscores + labels) ─────────────────
+
+  rows.push(emptyRow());
+  currentRow++;
+  rows.push(emptyRow());
+  currentRow++;
+
+  rows.push(makeRow({
+    2: makeCell({ value: '____________________' }),
+    8: makeCell({ value: '____________________' }),
+  }));
+  currentRow++;
+
+  rows.push(makeRow({
+    2: makeCell({ value: 'Nombre' }),
+    8: makeCell({ value: 'Firma' }),
+  }));
+  currentRow++;
+
+  return { rows, merges };
 };
 
-// ── Fix ExcelJS dimension bug ────────────────────────────────────────────────
-// ExcelJS miscalculates the worksheet dimension, outputting "D1:K…" instead of
-// "C1:K…". Google Sheets uses this tag to determine the used range and silently
-// drops any data outside it. This helper patches the raw xlsx zip to correct it.
+// ── Build batchUpdate requests for all sheets ────────────────────────────────
 
-const fixXlsxDimension = async (buffer: ExcelJS.Buffer): Promise<ArrayBuffer> => {
-  const zip = await JSZip.loadAsync(buffer);
-  const sheetPath = 'xl/worksheets/sheet1.xml';
-  const xml = await zip.file(sheetPath)?.async('string');
-  if (!xml) return buffer as ArrayBuffer;
+const buildAllRequests = (
+  pageDataArray: PageData[],
+): Record<string, unknown>[] => {
+  const requests: Record<string, unknown>[] = [];
 
-  // Remove the dimension tag entirely.
-  // ExcelJS miscalculates it (D1 instead of C1), and the tag also causes
-  // Apple Numbers to draw an unwanted table outline around the used range.
-  // Excel/Google Sheets recalculate the range from actual cell data on open.
-  const fixed = xml.replace(/<dimension ref="[^"]*"\/>\s*/, '');
+  for (let i = 0; i < pageDataArray.length; i++) {
+    const { rows, merges } = pageDataArray[i];
+    const sheetId = i;
 
-  if (fixed !== xml) {
-    zip.file(sheetPath, fixed);
-    return zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE' });
+    // Hide gridlines
+    requests.push({
+      updateSheetProperties: {
+        properties: {
+          sheetId,
+          gridProperties: { hideGridlines: true },
+        },
+        fields: 'gridProperties.hideGridlines',
+      },
+    });
+
+    // Column widths
+    for (const [colStr, widthPx] of Object.entries(COLUMN_WIDTHS_PX)) {
+      const col = Number(colStr);
+      requests.push({
+        updateDimensionProperties: {
+          range: { sheetId, dimension: 'COLUMNS', startIndex: col, endIndex: col + 1 },
+          properties: { pixelSize: widthPx },
+          fields: 'pixelSize',
+        },
+      });
+    }
+
+    // Row heights
+    if (rows.length > 0) {
+      requests.push({
+        updateDimensionProperties: {
+          range: { sheetId, dimension: 'ROWS', startIndex: 0, endIndex: rows.length },
+          properties: { pixelSize: ROW_HEIGHT_PX },
+          fields: 'pixelSize',
+        },
+      });
+    }
+
+    // Cell data + formatting
+    requests.push({
+      updateCells: {
+        start: { sheetId, rowIndex: 0, columnIndex: 0 },
+        rows,
+        fields: 'userEnteredValue,userEnteredFormat',
+      },
+    });
+
+    // Merges
+    for (const merge of merges) {
+      requests.push({ mergeCells: { range: merge, mergeType: 'MERGE_ALL' } });
+    }
   }
-  return buffer as ArrayBuffer;
+
+  return requests;
+};
+
+// ── Create spreadsheet via Sheets API ────────────────────────────────────────
+
+const createSpreadsheet = async (
+  accessToken: string,
+  title: string,
+  sheetNames: string[],
+): Promise<{ spreadsheetId: string; spreadsheetUrl: string }> => {
+  const sheets = sheetNames.map((name, i) => ({
+    properties: { sheetId: i, title: name },
+  }));
+
+  const response = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      properties: { title },
+      sheets,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.error?.message || 'Failed to create spreadsheet');
+  }
+
+  const data = await response.json();
+  return { spreadsheetId: data.spreadsheetId, spreadsheetUrl: data.spreadsheetUrl };
+};
+
+// ── Move file to Drive folder ────────────────────────────────────────────────
+
+const moveToFolder = async (
+  fileId: string,
+  folderId: string,
+  accessToken: string,
+): Promise<void> => {
+  await fetch(
+    `https://www.googleapis.com/drive/v3/files/${fileId}?addParents=${folderId}`,
+    { method: 'PATCH', headers: { Authorization: `Bearer ${accessToken}` } },
+  );
 };
 
 // ── Main export function ─────────────────────────────────────────────────────
 
-export const exportOrdersToExcel = async (
+export const exportOrdersToGoogleSheet = async (
   orders: OrderRow[],
-): Promise<{ success: boolean; error?: string }> => {
+  organizationId: string,
+  exportedBy?: string,
+): Promise<{ success: boolean; sheetUrl?: string; error?: string }> => {
   try {
     if (!orders || orders.length === 0) {
       return { success: false, error: 'No orders to export' };
@@ -296,249 +843,91 @@ export const exportOrdersToExcel = async (
 
     const blocks = buildCustomerBlocks(orders);
     const pages = paginateCustomers(blocks);
-    const totalPages = pages.length;
 
     console.log(
-      `Desarrollo export: ${orders.length} orders → ${blocks.length} customers → ${totalPages} page(s)`,
+      `Desarrollo export: ${orders.length} orders → ${blocks.length} customers → ${pages.length} page(s)`,
     );
 
-    // ── Create workbook from scratch ─────────────────────────────────────
-    const workbook = new ExcelJS.Workbook();
-    const ws = workbook.addWorksheet('CONTROL');
+    const accessToken = await getValidAccessToken(organizationId);
 
-    // Column widths
-    for (const [letter, width] of Object.entries(COLUMN_WIDTHS)) {
-      ws.getColumn(letter).width = width;
-    }
-
-    // Hide gridlines + page setup
-    ws.views = [{ showGridLines: false }];
-    ws.pageSetup = {
-      fitToPage: true,
-      fitToWidth: 1,
-      fitToHeight: 0,
-      orientation: 'portrait',
-      margins: {
-        left: 0.25, right: 0.25,
-        top: 0.93, bottom: 0.75,
-        header: 0, footer: 0,
-      },
-      showGridLines: false,
-      showRowColHeaders: false,
-    };
-
-    let currentRow = 1;
-    const subtotalJRefs: string[] = [];
-
-    // ── Write pages ──────────────────────────────────────────────────────
-    for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
-      const page = pages[pageIndex];
-      const isFirstPage = pageIndex === 0;
-      const isLastPage = pageIndex === pages.length - 1;
-
-      // Title block on every page (7 rows)
-      writeTitleBlock(ws, currentRow, pageIndex + 1, totalPages);
-      currentRow += 7;
-
-      // Blank row between title and content (all pages, matching PDF)
-      ws.getRow(currentRow).height = ROW_HEIGHT;
-      currentRow++;
-
-      if (isFirstPage) {
-        // Column headers (page 1 only): 2 rows
-        writeHeaders(ws, currentRow);
-        currentRow += 2;
-      }
-
-      // ── Write customer blocks for this page ────────────────────────────
-      const customerTotalJRefs: string[] = [];
-
-      for (const block of page) {
-        const firstItemRow = currentRow;
-
-        // Item rows
-        for (let itemIndex = 0; itemIndex < block.items.length; itemIndex++) {
-          const item = block.items[itemIndex];
-          ws.getRow(currentRow).height = ROW_HEIGHT;
-
-          if (itemIndex === 0) {
-            const cCell = ws.getCell(`C${currentRow}`);
-            cCell.value = block.consignee;
-            cCell.font = { ...FONT };
-
-            const dCell = ws.getCell(`D${currentRow}`);
-            dCell.value = block.packageNumber;
-            dCell.font = { ...FONT_BOLD };
-          }
-
-          const eCell = ws.getCell(`E${currentRow}`);
-          eCell.value = item.quantity;
-          eCell.font = { ...FONT };
-
-          const fCell = ws.getCell(`F${currentRow}`);
-          fCell.value = item.description;
-          fCell.font = { ...FONT };
-
-          const hCell = ws.getCell(`H${currentRow}`);
-          hCell.value = 'X';
-          hCell.font = { ...FONT };
-
-          const iCell = ws.getCell(`I${currentRow}`);
-          iCell.value = item.unitValue;
-          iCell.font = { ...FONT };
-          iCell.numFmt = CURRENCY_FORMAT;
-
-          const jCell = ws.getCell(`J${currentRow}`);
-          jCell.value = item.totalValue;
-          jCell.font = { ...FONT };
-          jCell.numFmt = CURRENCY_FORMAT;
-
-          // Grid borders on all cells C-K
-          applyGridBorders(ws, currentRow);
-          currentRow++;
-        }
-
-        const lastItemRow = currentRow - 1;
-
-        // ── Customer TOTAL row ─────────────────────────────────────────
-        ws.getRow(currentRow).height = ROW_HEIGHT;
-
-        const eTotal = ws.getCell(`E${currentRow}`);
-        eTotal.value = block.totalQuantity;
-        eTotal.font = { ...FONT_BOLD };
-
-        const iTotal = ws.getCell(`I${currentRow}`);
-        iTotal.value = 'TOTAL';
-        iTotal.font = { ...FONT_BOLD };
-
-        const jTotal = ws.getCell(`J${currentRow}`);
-        if (block.items.length > 1) {
-          jTotal.value = { formula: `SUM(J${firstItemRow}:J${lastItemRow})` };
-        } else {
-          jTotal.value = block.totalValue;
-        }
-        jTotal.font = { ...FONT_BOLD };
-        jTotal.numFmt = CURRENCY_FORMAT;
-
-        // Grid borders on TOTAL row too
-        applyGridBorders(ws, currentRow);
-
-        customerTotalJRefs.push(`J${currentRow}`);
-        currentRow++;
-
-        // Blank separator row (still part of the grid — gets borders)
-        ws.getRow(currentRow).height = ROW_HEIGHT;
-        applyGridBorders(ws, currentRow);
-        currentRow++;
-      }
-
-      // ── Page SUBTOTAL row ────────────────────────────────────────────
-      ws.getRow(currentRow).height = ROW_HEIGHT;
-
-      const hSub = ws.getCell(`H${currentRow}`);
-      hSub.value = 'SUBTOTAL';
-      hSub.font = { ...FONT_BOLD };
-
-      const iSub = ws.getCell(`I${currentRow}`);
-      iSub.value = 'SUBTOTAL';
-      iSub.font = { ...FONT_BOLD };
-
-      const jSub = ws.getCell(`J${currentRow}`);
-      jSub.value = { formula: customerTotalJRefs.join('+') };
-      jSub.font = { ...FONT_BOLD };
-      jSub.numFmt = CURRENCY_FORMAT;
-
-      // SUBTOTAL has special border pattern (H/J merge visual)
-      applySubtotalBorders(ws, currentRow);
-
-      subtotalJRefs.push(`J${currentRow}`);
-      currentRow++;
-
-      // ── Grand TOTAL (last page only, when multiple pages) ────────────
-      if (isLastPage && totalPages > 1) {
-        ws.getRow(currentRow).height = ROW_HEIGHT;
-
-        const iGrand = ws.getCell(`I${currentRow}`);
-        iGrand.value = 'TOTAL';
-        iGrand.font = { ...FONT_BOLD };
-
-        const jGrand = ws.getCell(`J${currentRow}`);
-        jGrand.value = { formula: subtotalJRefs.join('+') };
-        jGrand.font = { ...FONT_BOLD };
-        jGrand.numFmt = CURRENCY_FORMAT;
-
-        // Same border pattern as SUBTOTAL
-        applySubtotalBorders(ws, currentRow);
-        currentRow++;
-      }
-
-      // ── 2 blank rows + signature (NO borders — outside the grid) ────
-      ws.getRow(currentRow).height = ROW_HEIGHT;
-      currentRow++;
-      ws.getRow(currentRow).height = ROW_HEIGHT;
-      currentRow++;
-
-      // Signature lines (matching PDF: left under Consignatario, right under Valor Unit)
-      ws.getRow(currentRow).height = ROW_HEIGHT;
-      ws.getCell(`C${currentRow}`).value = '__________________';
-      ws.getCell(`C${currentRow}`).font = { ...FONT };
-      ws.getCell(`I${currentRow}`).value = '__________________';
-      ws.getCell(`I${currentRow}`).font = { ...FONT };
-      currentRow++;
-
-      // Labels
-      ws.getRow(currentRow).height = ROW_HEIGHT;
-      ws.getCell(`C${currentRow}`).value = 'Nombre';
-      ws.getCell(`C${currentRow}`).font = { ...FONT };
-      ws.getCell(`I${currentRow}`).value = 'Firma';
-      ws.getCell(`I${currentRow}`).font = { ...FONT };
-      currentRow++;
-
-      // Blank row between pages (not after last page)
-      if (!isLastPage) {
-        ws.getRow(currentRow).height = ROW_HEIGHT;
-        currentRow++;
-      }
-    }
-
-    // No white fill — showGridLines:false handles grid hiding.
-    // Applying fill creates a visible "used range" outline in Numbers/Excel.
-
-    // ── Generate & download ──────────────────────────────────────────────
     const timestamp = new Date().toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
+      year: 'numeric', month: '2-digit', day: '2-digit',
     }).replace(/\//g, '-');
 
-    const filename = `Desarrollo_Export_${timestamp}_${orders.length}orders.xlsx`;
+    // Sheet tab names: "Hoja 1", "Hoja 2", ... (or just "CONTROL" for single page)
+    const sheetNames = pages.length === 1
+      ? ['CONTROL']
+      : pages.map((_, i) => `Hoja ${i + 1}`);
 
-    const rawBuffer = await workbook.xlsx.writeBuffer();
+    const title = `Desarrollo_Export_${timestamp}_${orders.length}orders`;
+    const { spreadsheetId, spreadsheetUrl } = await createSpreadsheet(accessToken, title, sheetNames);
+    console.log('✓ Spreadsheet created:', spreadsheetId);
 
-    // Fix ExcelJS dimension bug: it calculates "D1:K…" instead of "C1:K…",
-    // which causes Google Sheets to ignore all column C content on import.
-    const fixedBuffer = await fixXlsxDimension(rawBuffer);
+    // Build page data for each sheet
+    const pageDataArray: PageData[] = pages.map((page, i) =>
+      buildPageData(page, i, pages.length, i, sheetNames),
+    );
 
-    const blob = new Blob([fixedBuffer], {
-      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    });
+    const requests = buildAllRequests(pageDataArray);
 
-    const url = window.URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    window.URL.revokeObjectURL(url);
+    const batchResponse = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requests }),
+      },
+    );
 
-    console.log(`✓ Desarrollo export complete: ${filename}`);
-    return { success: true };
+    if (!batchResponse.ok) {
+      const error = await batchResponse.json();
+      console.error('batchUpdate failed:', error);
+      throw new Error(error.error?.message || 'Failed to format spreadsheet');
+    }
+
+    console.log('✓ Spreadsheet formatted');
+
+    // Move to Drive folder
+    const orgRef = doc(db, 'organizations', organizationId);
+    const orgSnap = await getDoc(orgRef);
+    const org = orgSnap.data() as Organization;
+
+    if (org.googleDriveFolderId) {
+      await moveToFolder(spreadsheetId, org.googleDriveFolderId, accessToken);
+      console.log('✓ Moved to Drive folder');
+    }
+
+    // Track in Firestore
+    try {
+      await addDoc(collection(db, 'exportHistory'), {
+        spreadsheetId, sheetUrl: spreadsheetUrl, organizationId,
+        organizationName: org.organizationName,
+        orderCount: orders.length,
+        customerNames: [...new Set(blocks.map(b => b.consignee).filter(Boolean))],
+        totalValue: blocks.reduce((sum, b) => sum + b.totalValue, 0),
+        exportedBy: exportedBy || 'unknown',
+        exportedAt: new Date(),
+        type: 'desarrollo',
+      });
+    } catch (historyError) {
+      console.warn('Failed to save export history:', historyError);
+    }
+
+    console.log(`✓ Desarrollo export complete: ${spreadsheetUrl}`);
+    return { success: true, sheetUrl: spreadsheetUrl };
   } catch (error) {
     console.error('Export failed:', error);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Unknown error occurred',
-    };
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+    const isAuthError = errorMessage.includes('authentication') ||
+                        errorMessage.includes('Unauthorized') ||
+                        errorMessage.includes('invalid authentication') ||
+                        errorMessage.includes('reconnect your Google account');
+    if (isAuthError) {
+      return {
+        success: false,
+        error: 'Google account authentication expired. Please go to Settings → Organization and reconnect your Google account.',
+      };
+    }
+    return { success: false, error: errorMessage };
   }
 };

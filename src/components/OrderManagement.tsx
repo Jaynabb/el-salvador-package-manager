@@ -4,7 +4,9 @@ import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, query, orderBy 
 import { db } from '../services/firebase';
 import { exportOrdersToGoogleDocs, startNewGoogleDoc } from '../services/orderExportService';
 import { exportOrdersToGoogleSheets, startNewGoogleSheet } from '../services/orderSheetsExportService';
-import { exportOrdersToExcel } from '../services/orderExcelExportService';
+import { exportOrdersToGoogleSheet } from '../services/orderExcelExportService';
+import { extractItemsFromDocText } from '../services/geminiService';
+import mammoth from 'mammoth';
 import type { PackageItem } from '../types';
 
 export interface OrderRow {
@@ -43,6 +45,8 @@ export default function OrderManagement() {
   const [galleryOpen, setGalleryOpen] = useState(false);
   const [galleryImages, setGalleryImages] = useState<string[]>([]);
   const [currentImageIndex, setCurrentImageIndex] = useState(0);
+  const [importingDoc, setImportingDoc] = useState(false);
+  const wordDocInputRef = React.useRef<HTMLInputElement>(null);
 
   // Filter state
   const [filterConsignee, setFilterConsignee] = useState('');
@@ -286,9 +290,13 @@ export default function OrderManagement() {
 
     setExportingSheets(true);
     try {
-      const result = await exportOrdersToExcel(selectedOrders);
+      const result = await exportOrdersToGoogleSheet(
+        selectedOrders,
+        currentUser?.organizationId || '',
+        currentUser?.uid,
+      );
 
-      if (result.success) {
+      if (result.success && result.sheetUrl) {
         // Count total items exported
         const totalItems = selectedOrders.reduce((sum, o) =>
           sum + (o.items?.length || 1), 0
@@ -297,9 +305,12 @@ export default function OrderManagement() {
         // Clear selections after successful export
         setSelectedRows(new Set());
 
+        // Open the Google Sheet in a new tab (same pattern as Machote)
+        window.open(result.sheetUrl, '_blank');
+
         alert(
           `✅ Successfully exported ${selectedOrders.length} order(s) with ${totalItems} line items!\n\n` +
-          `Customs Excel form downloaded with exact template formatting.\n` +
+          `Google Sheet opened in a new tab.\n` +
           `Ready for customs submission.`
         );
       } else {
@@ -310,6 +321,99 @@ export default function OrderManagement() {
       alert(`❌ Export failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     } finally {
       setExportingSheets(false);
+    }
+  };
+
+  const handleWordDocUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !currentUser?.organizationId) return;
+
+    // Reset input so the same file can be re-selected
+    e.target.value = '';
+
+    setImportingDoc(true);
+    try {
+      // Parse the Word doc to extract text
+      const arrayBuffer = await file.arrayBuffer();
+      const result = await mammoth.extractRawText({ arrayBuffer });
+      const docText = result.value;
+
+      if (!docText || docText.trim().length < 10) {
+        alert('The document appears to be empty or could not be read.');
+        return;
+      }
+
+      console.log(`Word doc extracted: ${docText.length} chars`);
+
+      // Ask for customer name if not in the document
+      const customerName = prompt('Customer name for this document:') || 'Unknown';
+      if (customerName === 'Unknown' && !confirm('No customer name provided. Continue with "Unknown"?')) return;
+
+      // Send to Gemini for item extraction
+      const extracted = await extractItemsFromDocText(docText, customerName);
+
+      if (!extracted.customers || extracted.customers.length === 0) {
+        alert('No items could be extracted from the document.');
+        return;
+      }
+
+      // Create orders in Firestore for each customer
+      const ordersRef = collection(db, 'organizations', currentUser.organizationId, 'orders');
+
+      // Get next package number
+      const existingOrders = await getDocs(query(ordersRef, orderBy('createdAt', 'desc')));
+      let highestPkg = 0;
+      existingOrders.docs.forEach(d => {
+        const match = (d.data().packageNumber || '').match(/Paquete #(\d+)/i);
+        if (match) highestPkg = Math.max(highestPkg, parseInt(match[1]));
+      });
+
+      let createdCount = 0;
+      let totalItems = 0;
+
+      for (const customer of extracted.customers) {
+        if (!customer.items || customer.items.length === 0) continue;
+
+        highestPkg++;
+        const orderData = {
+          packageNumber: `Paquete #${highestPkg}`,
+          date: new Date().toISOString().split('T')[0],
+          consignee: customer.name,
+          pieces: customer.totalPieces,
+          weight: '',
+          trackingNumber: '',
+          company: '',
+          value: customer.orderTotal,
+          parcelComp: '',
+          carriers: [],
+          screenshotUrls: [],
+          items: customer.items,
+          status: 'pending-review',
+          extractionStatus: 'completed',
+          source: 'word-doc',
+          sourceFileName: file.name,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        await addDoc(ordersRef, orderData);
+        createdCount++;
+        totalItems += customer.items.length;
+      }
+
+      // Reload orders to show new ones
+      await loadOrders();
+
+      alert(
+        `✅ Word doc imported successfully!\n\n` +
+        `Created ${createdCount} order(s) with ${totalItems} items.\n\n` +
+        `Review the orders below, then export to Desarrollo.`
+      );
+    } catch (error) {
+      console.error('Word doc import error:', error);
+      alert(`❌ Import failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setImportingDoc(false);
     }
   };
 
@@ -715,7 +819,7 @@ export default function OrderManagement() {
                     </>
                   ) : (
                     <>
-                      <span className="hidden sm:inline">📊 Download Desarrollo</span>
+                      <span className="hidden sm:inline">📊 Export Desarrollo</span>
                       <span className="sm:hidden">📊</span>
                     </>
                   )}
@@ -731,6 +835,30 @@ export default function OrderManagement() {
                 </button>
               </>
             )}
+            <button
+              onClick={() => wordDocInputRef.current?.click()}
+              disabled={importingDoc}
+              className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-purple-600 hover:bg-purple-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors flex items-center justify-center gap-2 whitespace-nowrap"
+            >
+              {importingDoc ? (
+                <>
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                  <span className="hidden sm:inline">Importing...</span>
+                </>
+              ) : (
+                <>
+                  <span className="hidden sm:inline">📄 Import Word Doc</span>
+                  <span className="sm:hidden">📄 Word</span>
+                </>
+              )}
+            </button>
+            <input
+              ref={wordDocInputRef}
+              type="file"
+              accept=".doc,.docx"
+              onChange={handleWordDocUpload}
+              className="hidden"
+            />
             <button
               onClick={loadOrders}
               className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors whitespace-nowrap"
@@ -1007,14 +1135,14 @@ export default function OrderManagement() {
           <div className="bg-slate-800 rounded-lg shadow-2xl max-w-md w-full border border-slate-600" onClick={(e) => e.stopPropagation()}>
             {/* Header */}
             <div className="p-6 border-b border-slate-700">
-              <h3 className="text-xl font-bold text-white">Download Desarrollo</h3>
+              <h3 className="text-xl font-bold text-white">Export Desarrollo</h3>
               <p className="text-slate-300 mt-2">Do you need to make any changes?</p>
             </div>
 
             {/* Body */}
             <div className="p-6">
               <p className="text-slate-400 text-sm mb-6">
-                All selected information will be downloaded into a new Desarrollo Excel file.
+                All selected information will be exported to a new Google Sheet.
               </p>
 
               {/* Action Buttons */}
@@ -1027,7 +1155,7 @@ export default function OrderManagement() {
                   className="w-full px-4 py-3 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
                 >
                   <span>✓</span>
-                  <span>No, proceed to download</span>
+                  <span>No, proceed to export</span>
                 </button>
                 <button
                   onClick={() => setShowDesarrolloConfirm(false)}

@@ -480,7 +480,7 @@ export default function BulkScreenshotUpload() {
           const orderData: any = {
             packageNumber: `Paquete #${packageNumber}`,
             date: localDate, // Use local date instead of ISO string to avoid timezone issues
-            consignee: customerName,
+            consignee: customerName.trim(),
             pieces: totalPieces,
             weight: weight,
             trackingNumber: '', // Leave empty for manual input
