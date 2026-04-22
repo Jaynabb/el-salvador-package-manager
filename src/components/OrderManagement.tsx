@@ -259,20 +259,25 @@ export default function OrderManagement() {
             totalPieces += extracted.totalPieces || 0;
           }
 
+          // Use item sum as the authoritative value (matches both export SUM formulas)
+          const itemSum = allItems.reduce((s, i) => s + (i.totalValue || 0), 0);
+          const finalValue = itemSum > 0 ? itemSum : (totalValue || order.value);
+          const finalPieces = allItems.reduce((s, i) => s + (i.quantity || 0), 0) || totalPieces || order.pieces;
+
           // Update order in Firestore
           const orderRef = doc(db, 'organizations', currentUser.organizationId, 'orders', order.id);
           await updateDoc(orderRef, {
             items: allItems,
-            value: totalValue || order.value,
-            pieces: totalPieces || order.pieces,
+            value: finalValue,
+            pieces: finalPieces,
           });
 
           // Update local state
           setOrders(prev => prev.map(o => o.id === order.id ? {
             ...o,
             items: allItems,
-            value: totalValue || o.value,
-            pieces: totalPieces || o.pieces,
+            value: finalValue,
+            pieces: finalPieces,
           } : o));
 
           successCount++;
