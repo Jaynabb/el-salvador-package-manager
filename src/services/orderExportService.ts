@@ -54,7 +54,7 @@ const normalizeImage = async (
   URL.revokeObjectURL(blobUrl);
 
   const blob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(b => b ? resolve(b) : reject(new Error('toBlob failed')), 'image/jpeg', 0.92);
+    canvas.toBlob(b => b ? resolve(b) : reject(new Error('toBlob failed')), 'image/jpeg', 0.85);
   });
 
   if (!storage) throw new Error('Firebase Storage not initialized');
@@ -426,6 +426,23 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
     index += 1;
   };
 
+  // Pre-normalize ALL images in parallel (biggest speed win — was sequential before)
+  const normalizedUrlMap = new Map<string, string>();
+  const allImageUrls = orders.flatMap(o => o.screenshotUrls || []);
+  if (allImageUrls.length > 0) {
+    const results = await Promise.allSettled(
+      allImageUrls.map(async (url) => {
+        const normalized = await normalizeImage(url, organizationId);
+        return { original: url, normalized };
+      })
+    );
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        normalizedUrlMap.set(result.value.original, result.value.normalized);
+      }
+    }
+  }
+
   // Format each order - SIMPLE format with only 4 fields + screenshots
   // If user manually edits any of these 4 fields in the table, export shows their edits
   for (const [orderIndex, order] of orders.entries()) {
@@ -463,12 +480,7 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
     // Page break after every 2nd image enforces 2-2-1 grouping.
     if (order.screenshotUrls && order.screenshotUrls.length > 0) {
       for (let i = 0; i < order.screenshotUrls.length; i++) {
-        let url = order.screenshotUrls[i];
-        try {
-          url = await normalizeImage(order.screenshotUrls[i], organizationId);
-        } catch (err) {
-          console.warn(`Image ${i} normalization failed, using original:`, err);
-        }
+        const url = normalizedUrlMap.get(order.screenshotUrls[i]) || order.screenshotUrls[i];
         insertImage(url);
         // After every 2nd image, page break if more images remain
         if (i % 2 === 1 && i < order.screenshotUrls.length - 1) {
