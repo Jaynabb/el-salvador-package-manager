@@ -281,7 +281,11 @@ const translateToSpanish = (text: string): string => {
   upper = upper.replace(/[A-ZÀ-Ú'-]+/g, (word) => WORD_MAP[word] || word);
 
   // Convert to title case (capitalize first letter of each word)
-  return upper.toLowerCase().replace(/(?:^|\s)\S/g, (c) => c.toUpperCase());
+  const titleCase = upper.toLowerCase().replace(/(?:^|\s)\S/g, (c) => c.toUpperCase());
+
+  // Truncate to max 5 words — customs needs short descriptions, not marketing copy
+  const words = titleCase.split(/\s+/).filter(Boolean);
+  return words.slice(0, 5).join(' ');
 };
 
 // ── Data structures ──────────────────────────────────────────────────────────
