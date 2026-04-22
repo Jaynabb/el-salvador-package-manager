@@ -255,7 +255,17 @@ const WORD_MAP: Record<string, string> = {
 const SORTED_PHRASES = Object.keys(PHRASE_MAP).sort((a, b) => b.length - a.length);
 
 // Words to filter out of descriptions (inappropriate for customs forms)
-const FLAGGED_WORDS = new Set(['SEXY', 'EROTIC', 'ADULT', 'SENSUAL', 'PROVOCATIVE', 'SEDUCTIVE']);
+const FLAGGED_WORDS = new Set(['SEXY', 'EROTIC', 'ADULT', 'SENSUAL', 'PROVOCATIVE', 'SEDUCTIVE',
+  'LENCERÍA', 'LENCERIA', 'ÍNTIMO', 'INTIMO', 'INTIMATE', 'LINGERIE', 'THONG', 'TANGA']);
+
+/** Strip flagged words from any description (customs or fallback) */
+const filterFlaggedWords = (text: string): string => {
+  let result = text;
+  for (const word of FLAGGED_WORDS) {
+    result = result.replace(new RegExp(`\\b${word}\\b`, 'gi'), '');
+  }
+  return result.replace(/\s{2,}/g, ' ').trim();
+};
 
 /**
  * Translate an item description from English to Spanish.
@@ -328,7 +338,7 @@ const buildCustomerBlocks = (orders: OrderRow[]): CustomerBlock[] => {
 
     const items = order.items.map(item => ({
       quantity: item.quantity || 0,
-      description: item.customsDescription || translateToSpanish(item.name || 'Item'),
+      description: filterFlaggedWords(item.customsDescription || translateToSpanish(item.name || 'Item')),
       unitValue: item.unitValue || 0,
       totalValue: item.totalValue || 0,
     }));
