@@ -456,9 +456,10 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
       insertText('\n');
     }
 
-    // 2. Package Number - uses exact value from table (order.packageNumber)
+    // 2. Package Number - stripped to digits only ("Paquete #1" → "1")
     if (order.packageNumber) {
-      insertText(`${order.packageNumber}\n`);
+      const pkgNum = order.packageNumber.replace(/\D+/g, '') || order.packageNumber;
+      insertText(`${pkgNum}\n`);
     }
 
     // 3. Carrier + Tracking (last 4 digits) - uses exact values from table
