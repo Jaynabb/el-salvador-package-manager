@@ -475,10 +475,11 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
       insertText('[Carrier] #[----]\n');
     }
 
-    // 4. Value - uses exact value from table (order.value)
-    // This reflects any manual edits the user made to the value field
-    if (order.value) {
-      insertText(`VALOR: $${Number(order.value).toFixed(2)}\n`);
+    // 4. Value - sum of item totalValues (matches Desarrollo SUM formula)
+    const itemsTotal = (order.items || []).reduce((sum, item) => sum + (item.totalValue || 0), 0);
+    const displayValue = itemsTotal > 0 ? itemsTotal : (order.value || 0);
+    if (displayValue) {
+      insertText(`VALOR: $${Number(displayValue).toFixed(2)}\n`);
     }
 
     // 5. Screenshots — normalized to exactly 3.11"×4.01", 2 per page with header.
