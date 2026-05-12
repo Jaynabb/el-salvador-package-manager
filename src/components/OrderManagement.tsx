@@ -1,12 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, query, orderBy } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { exportOrdersToGoogleDocs, startNewGoogleDoc } from '../services/orderExportService';
 import { exportOrdersToGoogleSheets, startNewGoogleSheet } from '../services/orderSheetsExportService';
 import { exportOrdersToGoogleSheet } from '../services/orderExcelExportService';
-import { extractItemsFromDocText } from '../services/geminiService';
+import { extractItemsFromDocText, analyzeOrderScreenshot } from '../services/geminiService';
 import mammoth from 'mammoth';
+import JSZip from 'jszip';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { storage } from '../services/firebase';
 import type { PackageItem } from '../types';
 
 export interface OrderRow {
@@ -27,6 +30,7 @@ export interface OrderRow {
   dateDelivered?: string; // Date when package was delivered (manual input)
   screenshotUrls: string[]; // Array of Firebase Storage URLs (one customer can have multiple screenshots)
   items?: PackageItem[]; // Array of line items extracted from screenshots
+  source?: string; // 'word-doc' for imported from Word document
   createdAt: Date;
 }
 
@@ -38,14 +42,18 @@ export default function OrderManagement() {
   const [exportingSheets, setExportingSheets] = useState(false);
   const [selectedRows, setSelectedRows] = useState<Set<string>>(new Set());
   const [showMachoteModal, setShowMachoteModal] = useState(false);
-  const [showDesarrolloConfirm, setShowDesarrolloConfirm] = useState(false);
   const [machoteAction, setMachoteAction] = useState<'append' | 'fresh'>('append');
+  const [showFilters, setShowFilters] = useState(false);
+  const [showExtraColumns, setShowExtraColumns] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('importflow-show-extra-cols') || 'false'); } catch { return false; }
+  });
   const [editingCell, setEditingCell] = useState<{ rowId: string; field: keyof OrderRow } | null>(null);
   const [editValue, setEditValue] = useState('');
   const [galleryOpen, setGalleryOpen] = useState(false);
   const [galleryImages, setGalleryImages] = useState<string[]>([]);
   const [currentImageIndex, setCurrentImageIndex] = useState(0);
   const [importingDoc, setImportingDoc] = useState(false);
+  const [importProgress, setImportProgress] = useState('');
   const wordDocInputRef = React.useRef<HTMLInputElement>(null);
 
   // Filter state
@@ -175,6 +183,11 @@ export default function OrderManagement() {
     setCurrentImageIndex((prev) => (prev - 1 + galleryImages.length) % galleryImages.length);
   };
 
+  // Drag-to-select state
+  const isDragging = useRef(false);
+  const dragMode = useRef<'select' | 'deselect'>('select');
+  const dragTouched = useRef<Set<string>>(new Set());
+
   const handleRowSelect = (rowId: string) => {
     const newSelected = new Set(selectedRows);
     if (newSelected.has(rowId)) {
@@ -184,6 +197,53 @@ export default function OrderManagement() {
     }
     setSelectedRows(newSelected);
   };
+
+  const handleDragStart = (rowId: string, e: React.MouseEvent | React.TouchEvent) => {
+    e.preventDefault();
+    isDragging.current = true;
+    dragMode.current = selectedRows.has(rowId) ? 'deselect' : 'select';
+    dragTouched.current = new Set([rowId]);
+    setSelectedRows(prev => {
+      const next = new Set(prev);
+      if (dragMode.current === 'select') next.add(rowId);
+      else next.delete(rowId);
+      return next;
+    });
+  };
+
+  const handleDragEnter = (rowId: string) => {
+    if (!isDragging.current || dragTouched.current.has(rowId)) return;
+    dragTouched.current.add(rowId);
+    setSelectedRows(prev => {
+      const next = new Set(prev);
+      if (dragMode.current === 'select') next.add(rowId);
+      else next.delete(rowId);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    const handleDragEnd = () => {
+      isDragging.current = false;
+      dragTouched.current = new Set();
+    };
+    const handleTouchMove = (e: TouchEvent) => {
+      if (!isDragging.current) return;
+      const touch = e.touches[0];
+      const el = document.elementFromPoint(touch.clientX, touch.clientY);
+      const row = el?.closest('tr');
+      const rowId = row?.getAttribute('data-row-id');
+      if (rowId) handleDragEnter(rowId);
+    };
+    window.addEventListener('mouseup', handleDragEnd);
+    window.addEventListener('touchend', handleDragEnd);
+    window.addEventListener('touchmove', handleTouchMove, { passive: true });
+    return () => {
+      window.removeEventListener('mouseup', handleDragEnd);
+      window.removeEventListener('touchend', handleDragEnd);
+      window.removeEventListener('touchmove', handleTouchMove);
+    };
+  }, []);
 
   const handleSelectAll = () => {
     // Use sortedOrders which already has filters applied
@@ -332,64 +392,414 @@ export default function OrderManagement() {
     e.target.value = '';
 
     setImportingDoc(true);
+    setImportProgress('Reading document...');
     try {
-      // Parse the Word doc to extract text
-      const arrayBuffer = await file.arrayBuffer();
-      const result = await mammoth.extractRawText({ arrayBuffer });
-      const docText = result.value;
+      console.log(`📄 handleWordDocUpload starting...`);
 
-      if (!docText || docText.trim().length < 10) {
-        alert('The document appears to be empty or could not be read.');
-        return;
+      const originalBuffer = await file.arrayBuffer();
+      console.log(`📄 File size: ${originalBuffer.byteLength} bytes`);
+
+      // Clone the ArrayBuffer so mammoth and JSZip each get their own copy
+      const mammothBuffer = originalBuffer.slice(0);
+      const zipBuffer = originalBuffer.slice(0);
+
+      // Step 1: Extract text with mammoth
+      const textResult = await mammoth.extractRawText({ arrayBuffer: mammothBuffer });
+      const docText = textResult.value;
+
+      console.log(`📄 Word doc text: ${docText.length} chars`);
+      console.log(`📄 Text preview: ${docText.substring(0, 200)}`);
+
+      // Step 2: Extract images directly from the docx ZIP using JSZip (works in all browsers)
+      console.log(`📄 About to call JSZip.loadAsync...`);
+      let zip: any;
+      try {
+        zip = await JSZip.loadAsync(zipBuffer);
+        console.log(`📄 JSZip loaded OK, files: ${Object.keys(zip.files).length}`);
+      } catch (zipErr) {
+        console.error(`📄 JSZip FAILED:`, zipErr);
+        console.error(`JSZip failed:`, zipErr);
+        throw zipErr;
+      }
+      const mediaFiles = Object.keys(zip.files)
+        .filter(f => f.startsWith('word/media/') && /\.(jpg|jpeg|png|gif|bmp)$/i.test(f))
+        .sort((a, b) => {
+          // Sort numerically: image1, image2, ..., image10, image11
+          const numA = parseInt(a.match(/image(\d+)/)?.[1] || '0');
+          const numB = parseInt(b.match(/image(\d+)/)?.[1] || '0');
+          return numA - numB;
+        });
+
+      // Also parse document.xml to get the actual image order as they appear in the doc
+      const docXml = await zip.file('word/document.xml')?.async('string');
+      const relsXml = await zip.file('word/_rels/document.xml.rels')?.async('string');
+
+      let orderedImageFiles = mediaFiles; // fallback to filename sort
+      if (docXml && relsXml) {
+        // Build rId -> filename map
+        const relMap: Record<string, string> = {};
+        const relRegex = /Id="(rId\d+)"[^>]*Target="(media\/[^"]+)"/g;
+        let relMatch;
+        while ((relMatch = relRegex.exec(relsXml)) !== null) {
+          relMap[relMatch[1]] = 'word/' + relMatch[2];
+        }
+
+        // Find image refs in document order
+        const imgRefRegex = /r:embed="(rId\d+)"/g;
+        let imgRef;
+        const docOrder: string[] = [];
+        while ((imgRef = imgRefRegex.exec(docXml)) !== null) {
+          const mapped = relMap[imgRef[1]];
+          if (mapped && mediaFiles.includes(mapped)) {
+            docOrder.push(mapped);
+          }
+        }
+        if (docOrder.length > 0) orderedImageFiles = docOrder;
       }
 
-      console.log(`Word doc extracted: ${docText.length} chars`);
+      console.log(`📄 Found ${orderedImageFiles.length} images in docx ZIP`);
 
-      // Ask for customer name if not in the document
-      const customerName = prompt('Customer name for this document:') || 'Unknown';
-      if (customerName === 'Unknown' && !confirm('No customer name provided. Continue with "Unknown"?')) return;
-
-      // Send to Gemini for item extraction
-      const extracted = await extractItemsFromDocText(docText, customerName);
-
-      if (!extracted.customers || extracted.customers.length === 0) {
-        alert('No items could be extracted from the document.');
-        return;
+      // Load all images as base64
+      const allImages: { base64: string; contentType: string }[] = [];
+      for (const imgFile of orderedImageFiles) {
+        const zipEntry = zip.file(imgFile);
+        if (!zipEntry) { console.warn(`Missing: ${imgFile}`); continue; }
+        const base64 = await zipEntry.async('base64');
+        const ext = imgFile.split('.').pop()?.toLowerCase() || 'jpg';
+        const contentType = ext === 'png' ? 'image/png' : 'image/jpeg';
+        allImages.push({ base64, contentType });
       }
 
-      // Create orders in Firestore for each customer
+      console.log(`📄 Loaded ${allImages.length} images as base64`);
+
+      // Step 3: Detect Machote format
+      // New format: "1 Julio Smith" (number + name on one line)
+      // Old format: "Paquete #1" on a separate line
+      const hasPaquete = /Paquete\s*#?\s*\d+/i.test(docText);
+      const hasNumberedNames = /^\s*\d{1,3}\s+[A-Za-zÀ-ÿ]+\s+[A-Za-zÀ-ÿ]/m.test(docText);
+      const isMachote = (hasPaquete || hasNumberedNames) && allImages.length > 0;
+      const hasImages = allImages.length > 0;
+
+      console.log(`📄 isMachote=${isMachote}, hasImages=${hasImages} (hasPaquete=${hasPaquete}, hasNumberedNames=${hasNumberedNames}, images=${allImages.length})`);
+
       const ordersRef = collection(db, 'organizations', currentUser.organizationId, 'orders');
 
-      // Get next package number
-      const existingOrders = await getDocs(query(ordersRef, orderBy('createdAt', 'desc')));
-      let highestPkg = 0;
-      existingOrders.docs.forEach(d => {
-        const match = (d.data().packageNumber || '').match(/Paquete #(\d+)/i);
-        if (match) highestPkg = Math.max(highestPkg, parseInt(match[1]));
-      });
+      if (isMachote) {
+        // --- Machote format: parse text to find customer blocks, assign images by document order ---
 
-      let createdCount = 0;
-      let totalItems = 0;
+        // Parse customer blocks from document.xml text nodes + image refs
+        // Text events and image events in document order
+        interface DocEvent { type: 'text' | 'image'; value: string; pos: number }
+        const events: DocEvent[] = [];
 
-      for (const customer of extracted.customers) {
-        if (!customer.items || customer.items.length === 0) continue;
+        if (docXml) {
+          const textRegex = /<w:t[^>]*>([^<]+)<\/w:t>/g;
+          let tm;
+          while ((tm = textRegex.exec(docXml)) !== null) {
+            events.push({ type: 'text', value: tm[1], pos: tm.index });
+          }
 
-        highestPkg++;
+          // Build rId -> image index map
+          const relMap2: Record<string, string> = {};
+          if (relsXml) {
+            const relRegex2 = /Id="(rId\d+)"[^>]*Target="(media\/[^"]+)"/g;
+            let rm;
+            while ((rm = relRegex2.exec(relsXml)) !== null) {
+              relMap2[rm[1]] = 'word/' + rm[2];
+            }
+          }
+
+          const imgRefRegex2 = /r:embed="(rId\d+)"/g;
+          let ir;
+          let imgSeqIdx = 0;
+          while ((ir = imgRefRegex2.exec(docXml)) !== null) {
+            const mapped = relMap2[ir[1]];
+            if (mapped && orderedImageFiles.includes(mapped)) {
+              events.push({ type: 'image', value: String(imgSeqIdx), pos: ir.index });
+              imgSeqIdx++;
+            }
+          }
+        }
+
+        events.sort((a, b) => a.pos - b.pos);
+
+        // Split events into customer blocks
+        // Supports two formats:
+        //   New: "1 Julio Smith" (number + name on one line, centered above screenshots)
+        //   Old: separate lines for name, "Paquete #N", carrier, VALOR
+        interface MachoteBlock {
+          name: string;
+          packageNumber: string;
+          carrier: string;
+          trackingLast4: string;
+          value: number;
+          imageIndices: number[];
+        }
+
+        const blocks: MachoteBlock[] = [];
+        let currentBlock: MachoteBlock | null = null;
+        let textBuffer = '';
+
+        // Detect which format we're dealing with
+        const useNewFormat = hasNumberedNames && !hasPaquete;
+
+        for (const ev of events) {
+          if (ev.type === 'text') {
+            textBuffer += ev.value + ' ';
+
+            if (useNewFormat) {
+              // New format: "1 Julio Smith" — 1-3 digit number followed by first + last name
+              const nMatch = textBuffer.match(/(\d{1,3})\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.'-]*\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s.'-]*)/);
+              if (nMatch && (!currentBlock || currentBlock.packageNumber !== nMatch[1])) {
+                currentBlock = {
+                  name: nMatch[2].trim(),
+                  packageNumber: nMatch[1],
+                  carrier: '',
+                  trackingLast4: '',
+                  value: 0,
+                  imageIndices: [],
+                };
+                blocks.push(currentBlock);
+                textBuffer = '';
+              }
+            } else {
+              // Old format: "Paquete #N" with name on a previous line
+              const pMatch = textBuffer.match(/Paquete\s*#(\d+)/i);
+              if (pMatch && (!currentBlock || currentBlock.packageNumber !== pMatch[1])) {
+                const beforeText = textBuffer;
+                let name = 'Unknown';
+                const pIdx = beforeText.lastIndexOf('Paquete');
+                const textBefore = beforeText.substring(0, pIdx).trim();
+                const segments = textBefore.split(/(?:VALOR|VAR|USPS|UPS|FedEx|DHL|SpeedX|#\d{4}|\$[\d,.]+|:)/i).filter(s => s.trim().length > 1);
+                if (segments.length > 0) {
+                  const candidate = segments[segments.length - 1].trim();
+                  if (candidate.length > 1 && candidate.length < 60) {
+                    name = candidate;
+                  }
+                }
+
+                currentBlock = {
+                  name,
+                  packageNumber: pMatch[1],
+                  carrier: '',
+                  trackingLast4: '',
+                  value: 0,
+                  imageIndices: [],
+                };
+                blocks.push(currentBlock);
+                textBuffer = '';
+              }
+            }
+          } else if (ev.type === 'image' && currentBlock) {
+            currentBlock.imageIndices.push(parseInt(ev.value));
+          }
+        }
+
+        // For old format, extract carrier/tracking/valor from surrounding text
+        if (!useNewFormat) {
+          const rawLines = docText.replace(/\s+/g, ' ');
+          for (const block of blocks) {
+            const paquetePattern = new RegExp(`Paquete\\s*#${block.packageNumber}\\b([\\s\\S]{0,200})`, 'i');
+            const afterMatch = rawLines.match(paquetePattern);
+            if (afterMatch) {
+              const afterText = afterMatch[1];
+              const cm = afterText.match(/\b(USPS|UPS|FedEx|DHL|SpeedX|OnTrac|LaserShip)\s*#?\s*(\d{4})\b/i);
+              if (cm) { block.carrier = cm[1]; block.trackingLast4 = cm[2]; }
+              const vm = afterText.match(/VALO?R\s*:?\s*\$?\s*([\d,]+\.?\d*)/i) || afterText.match(/\$\s*([\d,]+\.?\d*)/);
+              if (vm) block.value = parseFloat(vm[1].replace(',', ''));
+            }
+            if (!block.carrier) {
+              const beforePattern = new RegExp(`([\\s\\S]{0,200})Paquete\\s*#${block.packageNumber}\\b`, 'i');
+              const beforeMatch = rawLines.match(beforePattern);
+              if (beforeMatch) {
+                const bText = beforeMatch[1];
+                const cm2 = bText.match(/\b(USPS|UPS|FedEx|DHL|SpeedX|OnTrac|LaserShip)\s*#?\s*(\d{4})\b/i);
+                if (cm2) { block.carrier = cm2[1]; block.trackingLast4 = cm2[2]; }
+              }
+            }
+          }
+        }
+
+        for (const block of blocks) {
+          console.log(`📦 #${block.packageNumber}: ${block.name}, ${block.imageIndices.length} imgs`);
+        }
+
+        if (blocks.length === 0) {
+          alert('No customer blocks found in the Machote document.');
+          return;
+        }
+
+        // Process screenshots through Gemini vision
+        const CONCURRENCY = 3;
+        const totalScreenshots = blocks.reduce((sum, b) => sum + b.imageIndices.length, 0);
+        let processedCount = 0;
+
+        console.log(`📸 Processing ${totalScreenshots} screenshots across ${blocks.length} customers...`);
+        setImportProgress(`Found ${blocks.length} customers, ${totalScreenshots} screenshots. Analyzing...`);
+
+        let createdCount = 0;
+        let totalItems = 0;
+
+        for (const block of blocks) {
+          const allItemsForBlock: PackageItem[] = [];
+
+          // Process images in batches
+          for (let j = 0; j < block.imageIndices.length; j += CONCURRENCY) {
+            const batch = block.imageIndices.slice(j, j + CONCURRENCY);
+            const results = await Promise.allSettled(
+              batch.map(async (imgIdx) => {
+                const img = allImages[imgIdx];
+                if (!img) return null;
+                return analyzeOrderScreenshot(img.base64, img.contentType, true);
+              })
+            );
+
+            for (const result of results) {
+              processedCount++;
+              console.log(`📸 Screenshot ${processedCount}/${totalScreenshots} done`);
+              setImportProgress(`Analyzing screenshot ${processedCount}/${totalScreenshots}...`);
+              if (result.status === 'fulfilled' && result.value) {
+                if (result.value.items && result.value.items.length > 0) {
+                  allItemsForBlock.push(...result.value.items);
+                }
+              } else if (result.status === 'rejected') {
+                console.warn(`⚠️ Screenshot failed:`, (result.reason as any)?.message || result.reason);
+              }
+            }
+          }
+
+          // Upload screenshots to Firebase Storage
+          const screenshotUrls: string[] = [];
+          for (const imgIdx of block.imageIndices) {
+            try {
+              const img = allImages[imgIdx];
+              if (!img) continue;
+              const ext = img.contentType.split('/')[1] || 'jpg';
+              const byteChars = atob(img.base64);
+              const byteArray = new Uint8Array(byteChars.length);
+              for (let k = 0; k < byteChars.length; k++) {
+                byteArray[k] = byteChars.charCodeAt(k);
+              }
+              const blob = new Blob([byteArray], { type: img.contentType });
+
+              const timestamp = Date.now();
+              const fileName = `screenshots/org_${currentUser.organizationId}/machote_pkg${block.packageNumber}_${imgIdx}_${timestamp}.${ext}`;
+              const storageRef = ref(storage, fileName);
+              await uploadBytes(storageRef, blob);
+              const url = await getDownloadURL(storageRef);
+              screenshotUrls.push(url);
+            } catch (uploadErr) {
+              console.warn(`Failed to upload screenshot for ${block.name}:`, uploadErr);
+            }
+          }
+
+          const totalPieces = allItemsForBlock.reduce((s, item) => s + (item.quantity || 0), 0);
+          const itemsTotal = allItemsForBlock.reduce((s, item) => s + (item.totalValue || 0), 0);
+
+          const orderData = {
+            packageNumber: `Paquete #${block.packageNumber}`,
+            date: new Date().toISOString().split('T')[0],
+            consignee: block.name,
+            pieces: totalPieces,
+            weight: '',
+            trackingNumber: block.trackingLast4 || '',
+            company: '',
+            value: block.value > 0 ? block.value : itemsTotal,
+            parcelComp: block.carrier || '',
+            carriers: block.carrier ? [block.carrier] : [],
+            screenshotUrls,
+            items: allItemsForBlock,
+            status: 'pending-review',
+            extractionStatus: allItemsForBlock.length > 0 ? 'completed' : 'pending',
+            source: 'word-doc',
+            sourceFileName: file.name,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+
+          setImportProgress(`Saving order ${createdCount + 1}/${blocks.length}: ${block.name}...`);
+          await addDoc(ordersRef, orderData);
+          createdCount++;
+          totalItems += allItemsForBlock.length;
+        }
+
+        await loadOrders();
+
+        alert(
+          `✅ Machote imported!\n\n` +
+          `Created ${createdCount} order(s) with ${totalItems} items from ${totalScreenshots} screenshots.\n\n` +
+          `Review the orders below, then export to Desarrollo.`
+        );
+      } else if (hasImages) {
+        // --- Doc with images but no Paquete # pattern: ask for customer name, process all images as one order ---
+        const customerName = prompt('Customer name for this document:') || 'Unknown';
+        if (customerName === 'Unknown' && !confirm('No customer name provided. Continue with "Unknown"?')) return;
+
+        setImportProgress(`Processing ${allImages.length} screenshots...`);
+        const allItemsForOrder: PackageItem[] = [];
+        const CONCURRENCY = 3;
+        let processedCount = 0;
+
+        for (let j = 0; j < allImages.length; j += CONCURRENCY) {
+          const batch = allImages.slice(j, j + CONCURRENCY);
+          const results = await Promise.allSettled(
+            batch.map(async (img) => analyzeOrderScreenshot(img.base64, img.contentType, true))
+          );
+          for (const result of results) {
+            processedCount++;
+            setImportProgress(`Analyzing screenshot ${processedCount}/${allImages.length}...`);
+            if (result.status === 'fulfilled' && result.value?.items?.length > 0) {
+              allItemsForOrder.push(...result.value.items);
+            }
+          }
+        }
+
+        // Upload screenshots to Storage
+        const screenshotUrls: string[] = [];
+        for (let i = 0; i < allImages.length; i++) {
+          try {
+            const img = allImages[i];
+            const ext = img.contentType.split('/')[1] || 'jpg';
+            const byteChars = atob(img.base64);
+            const byteArray = new Uint8Array(byteChars.length);
+            for (let k = 0; k < byteChars.length; k++) byteArray[k] = byteChars.charCodeAt(k);
+            const blob = new Blob([byteArray], { type: img.contentType });
+            const timestamp = Date.now();
+            const fileName = `screenshots/org_${currentUser.organizationId}/doc_${i}_${timestamp}.${ext}`;
+            const storageRef = ref(storage, fileName);
+            await uploadBytes(storageRef, blob);
+            screenshotUrls.push(await getDownloadURL(storageRef));
+          } catch (err) {
+            console.warn(`Failed to upload image ${i}:`, err);
+          }
+        }
+
+        // Get next package number
+        const existingOrders = await getDocs(query(ordersRef, orderBy('createdAt', 'desc')));
+        let highestPkg = 0;
+        existingOrders.docs.forEach(d => {
+          const match = (d.data().packageNumber || '').match(/Paquete #(\d+)/i);
+          if (match) highestPkg = Math.max(highestPkg, parseInt(match[1]));
+        });
+
+        const totalPieces = allItemsForOrder.reduce((s, item) => s + (item.quantity || 0), 0);
+        const itemsTotal = allItemsForOrder.reduce((s, item) => s + (item.totalValue || 0), 0);
+
         const orderData = {
-          packageNumber: `Paquete #${highestPkg}`,
+          packageNumber: `Paquete #${highestPkg + 1}`,
           date: new Date().toISOString().split('T')[0],
-          consignee: customer.name,
-          pieces: customer.totalPieces,
+          consignee: customerName,
+          pieces: totalPieces,
           weight: '',
           trackingNumber: '',
           company: '',
-          value: customer.orderTotal,
+          value: itemsTotal,
           parcelComp: '',
           carriers: [],
-          screenshotUrls: [],
-          items: customer.items,
+          screenshotUrls,
+          items: allItemsForOrder,
           status: 'pending-review',
-          extractionStatus: 'completed',
+          extractionStatus: allItemsForOrder.length > 0 ? 'completed' : 'pending',
           source: 'word-doc',
           sourceFileName: file.name,
           createdAt: new Date(),
@@ -397,23 +807,80 @@ export default function OrderManagement() {
         };
 
         await addDoc(ordersRef, orderData);
-        createdCount++;
-        totalItems += customer.items.length;
+        await loadOrders();
+
+        alert(
+          `✅ Doc imported!\n\n` +
+          `Created 1 order for "${customerName}" with ${allItemsForOrder.length} items from ${allImages.length} screenshots.\n\n` +
+          `Review the order below, then export to Desarrollo.`
+        );
+      } else {
+        // --- Plain text only (no images): extract text and send to Gemini ---
+        const customerName = prompt('Customer name for this document:') || 'Unknown';
+        if (customerName === 'Unknown' && !confirm('No customer name provided. Continue with "Unknown"?')) return;
+
+        const extracted = await extractItemsFromDocText(docText, customerName);
+
+        if (!extracted.customers || extracted.customers.length === 0) {
+          alert('No items could be extracted from the document.');
+          return;
+        }
+
+        // Get next package number
+        const existingOrders = await getDocs(query(ordersRef, orderBy('createdAt', 'desc')));
+        let highestPkg = 0;
+        existingOrders.docs.forEach(d => {
+          const match = (d.data().packageNumber || '').match(/Paquete #(\d+)/i);
+          if (match) highestPkg = Math.max(highestPkg, parseInt(match[1]));
+        });
+
+        let createdCount = 0;
+        let totalItems = 0;
+
+        for (const customer of extracted.customers) {
+          if (!customer.items || customer.items.length === 0) continue;
+
+          highestPkg++;
+          const orderData = {
+            packageNumber: `Paquete #${highestPkg}`,
+            date: new Date().toISOString().split('T')[0],
+            consignee: customer.name,
+            pieces: customer.totalPieces,
+            weight: '',
+            trackingNumber: '',
+            company: '',
+            value: customer.orderTotal,
+            parcelComp: '',
+            carriers: [],
+            screenshotUrls: [],
+            items: customer.items,
+            status: 'pending-review',
+            extractionStatus: 'completed',
+            source: 'word-doc',
+            sourceFileName: file.name,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+
+          await addDoc(ordersRef, orderData);
+          createdCount++;
+          totalItems += customer.items.length;
+        }
+
+        await loadOrders();
+
+        alert(
+          `✅ Word doc imported!\n\n` +
+          `Created ${createdCount} order(s) with ${totalItems} items.\n\n` +
+          `Review the orders below, then export to Desarrollo.`
+        );
       }
-
-      // Reload orders to show new ones
-      await loadOrders();
-
-      alert(
-        `✅ Word doc imported successfully!\n\n` +
-        `Created ${createdCount} order(s) with ${totalItems} items.\n\n` +
-        `Review the orders below, then export to Desarrollo.`
-      );
     } catch (error) {
       console.error('Word doc import error:', error);
       alert(`❌ Import failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     } finally {
       setImportingDoc(false);
+      setImportProgress('');
     }
   };
 
@@ -612,146 +1079,166 @@ export default function OrderManagement() {
     return sortOrder === 'asc' ? comparison : -comparison;
   });
 
-  // Get unique consignees for dropdown
-  const uniqueConsignees = Array.from(new Set(orders.map(o => o.consignee))).sort();
+  const activeFilterCount = [filterDateFrom, filterDateTo, sortBy !== 'none' ? sortBy : ''].filter(Boolean).length;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {/* Header */}
-      <div className="bg-slate-800 rounded-lg shadow-lg p-6 border border-slate-700">
-        <h1 className="text-2xl font-bold text-white mb-2">📊 Order Management</h1>
-        <p className="text-slate-400">
-          All orders are automatically populated from screenshots. Click any cell to edit.
-        </p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-white">Order Management</h1>
+          <p className="text-slate-400 text-sm">{orders.length} order{orders.length !== 1 ? 's' : ''}</p>
+        </div>
       </div>
 
-      {/* Instructions - moved to top and simplified */}
-      <div className="bg-blue-900/20 border border-blue-700 rounded-lg p-3">
-        <p className="text-sm text-slate-300">
-          <span className="text-blue-400 font-semibold">Quick Guide:</span> Upload screenshots → AI extracts data → Click cells to edit → Select rows to export or delete
-        </p>
-      </div>
-
-      {/* Filters and Sorting */}
-      <div className="bg-slate-800 border border-slate-700 rounded-lg p-4">
-        <h3 className="text-lg font-semibold text-white mb-3">Filters & Sorting</h3>
-        <div className="flex flex-col gap-4">
-          {/* Filter Row */}
-          <div className="flex flex-col sm:flex-row gap-4">
-            <div className="flex-1">
-              <label className="block text-sm font-medium text-slate-300 mb-2">Filter by Consignee</label>
-              <select
-                value={filterConsignee}
-                onChange={(e) => setFilterConsignee(e.target.value)}
-                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-              >
-                <option value="">All Consignees</option>
-                {uniqueConsignees.map(name => (
-                  <option key={name} value={name}>{name}</option>
-                ))}
-              </select>
-            </div>
-            <div className="flex-1">
-              <label className="block text-sm font-medium text-slate-300 mb-2">Date From</label>
-              <input
-                type="date"
-                value={filterDateFrom}
-                onChange={(e) => setFilterDateFrom(e.target.value)}
-                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-              />
-            </div>
-            <div className="flex-1">
-              <label className="block text-sm font-medium text-slate-300 mb-2">Date To</label>
-              <input
-                type="date"
-                value={filterDateTo}
-                onChange={(e) => setFilterDateTo(e.target.value)}
-                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-              />
-            </div>
+      {/* Toolbar */}
+      <div className="bg-slate-800 rounded-lg border border-slate-700 p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Search */}
+          <div className="relative flex-1 min-w-[180px]">
+            <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            </svg>
+            <input
+              type="text"
+              value={filterConsignee}
+              onChange={(e) => setFilterConsignee(e.target.value)}
+              placeholder="Search by name..."
+              className="w-full pl-9 pr-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm placeholder-slate-400 focus:outline-none focus:border-blue-500"
+            />
+            {filterConsignee && (
+              <button onClick={() => setFilterConsignee('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-sm">
+                ✕
+              </button>
+            )}
           </div>
 
-          {/* Sort Row */}
-          <div className="flex flex-col sm:flex-row gap-4 border-t border-slate-700 pt-4">
-            <div className="flex-1">
-              <label className="block text-sm font-medium text-slate-300 mb-2">Sort By</label>
-              <select
-                value={sortBy}
-                onChange={(e) => setSortBy(e.target.value as any)}
-                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500"
-              >
-                <option value="none">No Sorting</option>
-                <option value="date">Date</option>
-                <option value="value">Value</option>
-                <option value="consignee">Consignee Name</option>
-                <option value="packageNumber">Package Number</option>
-              </select>
-            </div>
-            <div className="flex-1">
-              <label className="block text-sm font-medium text-slate-300 mb-2">Sort Order</label>
-              <select
-                value={sortOrder}
-                onChange={(e) => setSortOrder(e.target.value as 'asc' | 'desc')}
-                disabled={sortBy === 'none'}
-                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <option value="asc">
-                  {sortBy === 'date' ? 'Oldest to Newest' :
-                   sortBy === 'value' ? 'Low to High' :
-                   sortBy === 'consignee' ? 'A to Z' :
-                   sortBy === 'packageNumber' ? 'A to Z' :
-                   'Ascending'}
-                </option>
-                <option value="desc">
-                  {sortBy === 'date' ? 'Newest to Oldest' :
-                   sortBy === 'value' ? 'High to Low' :
-                   sortBy === 'consignee' ? 'Z to A' :
-                   sortBy === 'packageNumber' ? 'Z to A' :
-                   'Descending'}
-                </option>
-              </select>
-            </div>
-            {(filterConsignee || filterDateFrom || filterDateTo || sortBy !== 'none') && (
-              <div className="flex items-end">
-                <button
-                  onClick={() => {
-                    setFilterConsignee('');
-                    setFilterDateFrom('');
-                    setFilterDateTo('');
-                    setSortBy('none');
-                    setSortOrder('asc');
-                  }}
-                  className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors text-sm whitespace-nowrap"
+          {/* Filters toggle */}
+          <button
+            onClick={() => setShowFilters(!showFilters)}
+            className={`px-3 py-2 text-sm rounded-lg border transition-colors flex items-center gap-2 whitespace-nowrap ${
+              showFilters || activeFilterCount > 0 ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'
+            }`}
+          >
+            Filters
+            {activeFilterCount > 0 && (
+              <span className="bg-white/20 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center font-bold">
+                {activeFilterCount}
+              </span>
+            )}
+          </button>
+
+          {/* More Columns toggle */}
+          <button
+            onClick={() => {
+              const next = !showExtraColumns;
+              setShowExtraColumns(next);
+              localStorage.setItem('importflow-show-extra-cols', JSON.stringify(next));
+            }}
+            className={`px-3 py-2 text-sm rounded-lg border transition-colors whitespace-nowrap ${
+              showExtraColumns ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'
+            }`}
+          >
+            More Columns
+          </button>
+
+          {/* Import Doc */}
+          <button
+            onClick={() => wordDocInputRef.current?.click()}
+            disabled={importingDoc}
+            className="px-3 py-2 text-sm bg-purple-600 hover:bg-purple-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors flex items-center gap-2 whitespace-nowrap"
+          >
+            {importingDoc ? (
+              <>
+                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                <span className="hidden sm:inline">{importProgress || 'Importing...'}</span>
+                <span className="sm:hidden">...</span>
+              </>
+            ) : (
+              'Import Doc'
+            )}
+          </button>
+          <input
+            ref={wordDocInputRef}
+            type="file"
+            accept=".doc,.docx"
+            onChange={handleWordDocUpload}
+            className="hidden"
+          />
+
+          {/* Refresh */}
+          <button
+            onClick={loadOrders}
+            className="px-3 py-2 text-sm bg-slate-700 hover:bg-slate-600 border border-slate-600 text-slate-300 rounded-lg transition-colors whitespace-nowrap"
+          >
+            Refresh
+          </button>
+        </div>
+
+        {/* Collapsible filter panel */}
+        {showFilters && (
+          <div className="mt-3 pt-3 border-t border-slate-700">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Date From</label>
+                <input
+                  type="date"
+                  value={filterDateFrom}
+                  onChange={(e) => setFilterDateFrom(e.target.value)}
+                  className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Date To</label>
+                <input
+                  type="date"
+                  value={filterDateTo}
+                  onChange={(e) => setFilterDateTo(e.target.value)}
+                  className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Sort By</label>
+                <select
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value as any)}
+                  className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
                 >
-                  Clear All
+                  <option value="none">No Sorting</option>
+                  <option value="date">Date</option>
+                  <option value="value">Value</option>
+                  <option value="consignee">Consignee Name</option>
+                  <option value="packageNumber">Package Number</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Order</label>
+                <select
+                  value={sortOrder}
+                  onChange={(e) => setSortOrder(e.target.value as 'asc' | 'desc')}
+                  disabled={sortBy === 'none'}
+                  className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                >
+                  <option value="asc">{sortBy === 'date' ? 'Oldest first' : sortBy === 'value' ? 'Low to High' : 'A-Z'}</option>
+                  <option value="desc">{sortBy === 'date' ? 'Newest first' : sortBy === 'value' ? 'High to Low' : 'Z-A'}</option>
+                </select>
+              </div>
+            </div>
+            {activeFilterCount > 0 && (
+              <div className="mt-3 flex items-center justify-between">
+                <span className="text-xs text-slate-400">
+                  Showing {sortedOrders.length} of {orders.length} orders
+                </span>
+                <button
+                  onClick={() => { setFilterDateFrom(''); setFilterDateTo(''); setSortBy('none'); setSortOrder('asc'); }}
+                  className="text-xs text-red-400 hover:text-red-300 transition-colors"
+                >
+                  Clear filters
                 </button>
               </div>
             )}
           </div>
-
-          <div className="text-sm text-slate-400">
-            Showing {sortedOrders.length} of {orders.length} orders
-            {sortBy !== 'none' && ` • Sorted by ${sortBy === 'consignee' ? 'name' : sortBy} (${
-              sortBy === 'date' ? (sortOrder === 'asc' ? 'oldest first' : 'newest first') :
-              sortBy === 'value' ? (sortOrder === 'asc' ? 'low to high' : 'high to low') :
-              (sortOrder === 'asc' ? 'A-Z' : 'Z-A')
-            })`}
-          </div>
-        </div>
-      </div>
-
-      {/* Legend */}
-      <div className="bg-slate-800 border border-slate-700 rounded-lg p-3">
-        <div className="flex flex-wrap items-center gap-4 text-xs sm:text-sm">
-          <span className="text-slate-400 font-semibold">Legend:</span>
-          <div className="flex items-center gap-2">
-            <div className="w-4 h-4 bg-yellow-600/30 rounded"></div>
-            <span className="text-slate-300">Primary manual input fields</span>
-          </div>
-          <div className="text-slate-400 italic">
-            Note: All fields are editable by clicking on them
-          </div>
-        </div>
+        )}
       </div>
 
       {/* Export Progress Banner */}
@@ -773,101 +1260,6 @@ export default function OrderManagement() {
           </div>
         </div>
       )}
-
-      {/* Actions */}
-      <div className="bg-slate-800 rounded-lg shadow-lg p-4 border border-slate-700">
-        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-          <div className="flex items-center">
-            <span className="text-white text-sm">
-              {selectedRows.size > 0 ? `${selectedRows.size} row${selectedRows.size !== 1 ? 's' : ''} selected` : `${orders.length} total row${orders.length !== 1 ? 's' : ''}`}
-            </span>
-          </div>
-          <div className="flex flex-wrap gap-2 w-full sm:w-auto">
-            {selectedRows.size > 0 && (
-              <>
-                {/* Machote Export Button */}
-                <button
-                  onClick={() => setShowMachoteModal(true)}
-                  disabled={exporting || exportingSheets}
-                  className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors flex items-center justify-center gap-2"
-                >
-                  {exporting ? (
-                    <>
-                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                      <span className="hidden sm:inline">Exporting...</span>
-                      <span className="sm:hidden">Export</span>
-                    </>
-                  ) : (
-                    <>
-                      <span className="hidden sm:inline">📄 Export Machote</span>
-                      <span className="sm:hidden">📄 Machote</span>
-                    </>
-                  )}
-                </button>
-
-                {/* Desarrollo Button - Shows confirmation dialog before download */}
-                <button
-                  onClick={() => setShowDesarrolloConfirm(true)}
-                  disabled={exportingSheets || exporting}
-                  className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-green-600 hover:bg-green-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors flex items-center justify-center gap-2 whitespace-nowrap"
-                >
-                  {exportingSheets ? (
-                    <>
-                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                      <span className="hidden sm:inline">Exporting...</span>
-                      <span className="sm:hidden">Export</span>
-                    </>
-                  ) : (
-                    <>
-                      <span className="hidden sm:inline">📊 Export Desarrollo</span>
-                      <span className="sm:hidden">📊</span>
-                    </>
-                  )}
-                </button>
-
-                <button
-                  onClick={handleDeleteSelected}
-                  disabled={exporting || exportingSheets}
-                  className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-red-600 hover:bg-red-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors whitespace-nowrap"
-                >
-                  <span className="hidden sm:inline">🗑️ Delete</span>
-                  <span className="sm:hidden">🗑️</span>
-                </button>
-              </>
-            )}
-            <button
-              onClick={() => wordDocInputRef.current?.click()}
-              disabled={importingDoc}
-              className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-purple-600 hover:bg-purple-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors flex items-center justify-center gap-2 whitespace-nowrap"
-            >
-              {importingDoc ? (
-                <>
-                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                  <span className="hidden sm:inline">Importing...</span>
-                </>
-              ) : (
-                <>
-                  <span className="hidden sm:inline">📄 Import Word Doc</span>
-                  <span className="sm:hidden">📄 Word</span>
-                </>
-              )}
-            </button>
-            <input
-              ref={wordDocInputRef}
-              type="file"
-              accept=".doc,.docx"
-              onChange={handleWordDocUpload}
-              className="hidden"
-            />
-            <button
-              onClick={loadOrders}
-              className="flex-1 sm:flex-initial px-3 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors whitespace-nowrap"
-            >
-              🔄 <span className="hidden sm:inline">Refresh</span>
-            </button>
-          </div>
-        </div>
-      </div>
 
       {/* Table */}
       <div className="bg-slate-800 rounded-lg shadow-lg border border-slate-700 overflow-hidden">
@@ -893,16 +1285,19 @@ export default function OrderManagement() {
                 <th className="px-2 sm:px-4 py-2 sm:py-3 text-left text-white text-xs sm:text-sm font-semibold">Value</th>
                 <th className="px-2 sm:px-4 py-2 sm:py-3 text-left text-white text-xs sm:text-sm font-semibold">Company</th>
                 <th className="px-2 sm:px-4 py-2 sm:py-3 text-left text-white text-xs sm:text-sm font-semibold">Carrier</th>
-                {/* Manual inputs grouped together on the right (yellow) */}
-                <th className="px-2 sm:px-4 py-2 sm:py-3 text-left text-white text-xs sm:text-sm font-semibold bg-yellow-600/30 whitespace-nowrap" title="Manual input">Weight (lb)</th>
-                <th className="px-2 sm:px-4 py-2 sm:py-3 text-left text-white text-xs sm:text-sm font-semibold bg-yellow-600/30 whitespace-nowrap" title="Manual input">Customer Received</th>
-                <th className="px-2 sm:px-4 py-2 sm:py-3 text-left text-white text-xs sm:text-sm font-semibold bg-yellow-600/30 whitespace-nowrap" title="Manual input">Date Delivered</th>
+                {showExtraColumns && (
+                  <>
+                    <th className="px-2 sm:px-4 py-2 sm:py-3 text-left text-white text-xs sm:text-sm font-semibold whitespace-nowrap">Weight (lb)</th>
+                    <th className="px-2 sm:px-4 py-2 sm:py-3 text-left text-white text-xs sm:text-sm font-semibold whitespace-nowrap">Customer Received</th>
+                    <th className="px-2 sm:px-4 py-2 sm:py-3 text-left text-white text-xs sm:text-sm font-semibold whitespace-nowrap">Date Delivered</th>
+                  </>
+                )}
               </tr>
             </thead>
             <tbody>
               {sortedOrders.length === 0 ? (
                 <tr>
-                  <td colSpan={13} className="px-4 py-12 text-center text-slate-400">
+                  <td colSpan={showExtraColumns ? 13 : 10} className="px-4 py-12 text-center text-slate-400">
                     No orders yet. Upload screenshots to automatically populate this table.
                   </td>
                 </tr>
@@ -910,16 +1305,22 @@ export default function OrderManagement() {
                 sortedOrders.map((order, idx) => (
                   <tr
                     key={order.id}
+                    data-row-id={order.id}
                     className={`border-t border-slate-700 transition-colors ${
                       selectedRows.has(order.id) ? 'bg-blue-900/30' : 'hover:bg-slate-750'
                     }`}
                   >
-                    <td className="px-2 sm:px-4 py-2">
+                    <td
+                      className="px-2 sm:px-4 py-2 select-none"
+                      onMouseDown={(e) => handleDragStart(order.id, e)}
+                      onMouseEnter={() => handleDragEnter(order.id)}
+                      onTouchStart={(e) => handleDragStart(order.id, e)}
+                    >
                       <input
                         type="checkbox"
                         checked={selectedRows.has(order.id)}
                         onChange={() => handleRowSelect(order.id)}
-                        className="w-5 h-5 sm:w-4 sm:h-4 cursor-pointer"
+                        className="w-5 h-5 sm:w-4 sm:h-4 cursor-pointer pointer-events-none"
                       />
                     </td>
                     <td className="px-2 sm:px-4 py-2">
@@ -937,6 +1338,17 @@ export default function OrderManagement() {
                               {order.screenshotUrls.length}
                             </div>
                           )}
+                          {/* DOC badge for word-doc imports */}
+                          {(order as any).source === 'word-doc' && (
+                            <div className="absolute -bottom-1 -left-1 bg-purple-600 text-white text-[9px] font-bold rounded px-1 py-0.5 border border-slate-800">
+                              DOC
+                            </div>
+                          )}
+                        </div>
+                      ) : (order as any).source === 'word-doc' ? (
+                        <div className="w-16 h-16 sm:w-20 sm:h-20 bg-purple-900/30 rounded border border-purple-600 flex flex-col items-center justify-center text-purple-400 text-xs gap-1">
+                          <span className="text-lg">📄</span>
+                          <span className="text-[9px] font-bold">DOC</span>
                         </div>
                       ) : (
                         <div className="w-16 h-16 sm:w-20 sm:h-20 bg-slate-700 rounded border border-slate-600 flex items-center justify-center text-slate-500 text-xs">
@@ -953,10 +1365,13 @@ export default function OrderManagement() {
                     <td className="px-2 sm:px-4 py-2 text-white text-xs sm:text-sm">{renderCell(order, 'value')}</td>
                     <td className="px-2 sm:px-4 py-2 text-white text-xs sm:text-sm">{renderCell(order, 'company')}</td>
                     <td className="px-2 sm:px-4 py-2 text-white text-xs sm:text-sm">{renderCell(order, 'parcelComp')}</td>
-                    {/* Manual inputs grouped together on the right (yellow) */}
-                    <td className="px-2 sm:px-4 py-2 text-white text-xs sm:text-sm bg-yellow-600/10">{renderCell(order, 'weight')}</td>
-                    <td className="px-2 sm:px-4 py-2 text-white text-xs sm:text-sm bg-yellow-600/10">{renderCell(order, 'customerReceivedDate')}</td>
-                    <td className="px-2 sm:px-4 py-2 text-white text-xs sm:text-sm bg-yellow-600/10">{renderCell(order, 'dateDelivered')}</td>
+                    {showExtraColumns && (
+                      <>
+                        <td className="px-2 sm:px-4 py-2 text-white text-xs sm:text-sm">{renderCell(order, 'weight')}</td>
+                        <td className="px-2 sm:px-4 py-2 text-white text-xs sm:text-sm">{renderCell(order, 'customerReceivedDate')}</td>
+                        <td className="px-2 sm:px-4 py-2 text-white text-xs sm:text-sm">{renderCell(order, 'dateDelivered')}</td>
+                      </>
+                    )}
                   </tr>
                 ))
               )}
@@ -1029,6 +1444,46 @@ export default function OrderManagement() {
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Floating action bar when rows are selected */}
+      {selectedRows.size > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur border-t border-slate-600 shadow-2xl px-4 py-3">
+          <div className="max-w-7xl mx-auto flex items-center justify-between">
+            <span className="text-white font-medium text-sm">
+              {selectedRows.size} selected
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowMachoteModal(true)}
+                disabled={exporting || exportingSheets}
+                className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors flex items-center gap-2"
+              >
+                {exporting ? (
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                ) : null}
+                Machote
+              </button>
+              <button
+                onClick={handleExportToSheets}
+                disabled={exportingSheets || exporting}
+                className="px-4 py-2 text-sm bg-green-600 hover:bg-green-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors flex items-center gap-2"
+              >
+                {exportingSheets ? (
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                ) : null}
+                Desarrollo
+              </button>
+              <button
+                onClick={handleDeleteSelected}
+                disabled={exporting || exportingSheets}
+                className="px-4 py-2 text-sm bg-red-600 hover:bg-red-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+              >
+                Delete
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1129,46 +1584,6 @@ export default function OrderManagement() {
         </div>
       )}
 
-      {/* Desarrollo Confirmation Modal */}
-      {showDesarrolloConfirm && (
-        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={() => setShowDesarrolloConfirm(false)}>
-          <div className="bg-slate-800 rounded-lg shadow-2xl max-w-md w-full border border-slate-600" onClick={(e) => e.stopPropagation()}>
-            {/* Header */}
-            <div className="p-6 border-b border-slate-700">
-              <h3 className="text-xl font-bold text-white">Export Desarrollo</h3>
-              <p className="text-slate-300 mt-2">Do you need to make any changes?</p>
-            </div>
-
-            {/* Body */}
-            <div className="p-6">
-              <p className="text-slate-400 text-sm mb-6">
-                All selected information will be exported to a new Google Sheet.
-              </p>
-
-              {/* Action Buttons */}
-              <div className="flex flex-col gap-3">
-                <button
-                  onClick={() => {
-                    setShowDesarrolloConfirm(false);
-                    handleExportToSheets();
-                  }}
-                  className="w-full px-4 py-3 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
-                >
-                  <span>✓</span>
-                  <span>No, proceed to export</span>
-                </button>
-                <button
-                  onClick={() => setShowDesarrolloConfirm(false)}
-                  className="w-full px-4 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
-                >
-                  <span>✎</span>
-                  <span>Yes, add more information</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

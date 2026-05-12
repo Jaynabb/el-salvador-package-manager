@@ -317,9 +317,9 @@ const buildCustomerBlocks = (orders: OrderRow[]): CustomerBlock[] => {
     return nameA.localeCompare(nameB);
   });
 
-  return sorted.map(order => {
-    // Extract just the number from "Paquete #1" → "1"
-    const pkgNum = (order.packageNumber || '').replace(/\D+/g, '') || order.packageNumber || '';
+  return sorted.map((order) => {
+    // Keep the original package number from the Machote
+    const pkgNum = (order.packageNumber || '').replace(/[^\d]/g, '') || '0';
 
     if (!order.items || order.items.length === 0) {
       return {
@@ -678,16 +678,22 @@ const buildPageData = (
     : '0';
 
   rows.push(makeRow({
+    2: makeCell({ borders: ALL_BORDERS }),
+    3: makeCell({ borders: ALL_BORDERS }),
+    4: makeCell({ borders: ALL_BORDERS }),
+    5: makeCell({ borders: ALL_BORDERS }),
+    6: makeCell({ borders: ALL_BORDERS }),
     7: makeCell({
       value: 'SUBTOTAL', bold: true,
-      borders: { left: SOLID_BLACK, top: SOLID_BLACK, bottom: SOLID_BLACK },
+      borders: ALL_BORDERS,
     }),
     8: makeCell({ value: 'SUBTOTAL', bold: true, borders: ALL_BORDERS }),
     9: makeCell({
       formula: `=${subtotalFormula}`, bold: true,
-      borders: { right: SOLID_BLACK, top: SOLID_BLACK, bottom: SOLID_BLACK },
+      borders: ALL_BORDERS,
       numberFormat: CURRENCY_FORMAT,
     }),
+    10: makeCell({ borders: ALL_BORDERS }),
   }));
   currentRow++;
 
@@ -830,6 +836,32 @@ const createSpreadsheet = async (
   return { spreadsheetId: data.spreadsheetId, spreadsheetUrl: data.spreadsheetUrl };
 };
 
+// ── Share file so "anyone with the link" can view ───────────────────────────
+
+const shareFileWithLink = async (
+  fileId: string,
+  accessToken: string,
+): Promise<void> => {
+  try {
+    await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}/permissions`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          role: 'writer',
+          type: 'anyone',
+        }),
+      },
+    );
+  } catch (err) {
+    console.warn('Failed to set sharing permissions:', err);
+  }
+};
+
 // ── Move file to Drive folder ────────────────────────────────────────────────
 
 const moveToFolder = async (
@@ -900,6 +932,10 @@ export const exportOrdersToGoogleSheet = async (
     }
 
     console.log('✓ Spreadsheet formatted');
+
+    // Make accessible via link (so it works even in incognito/different accounts)
+    await shareFileWithLink(spreadsheetId, accessToken);
+    console.log('✓ Sharing permissions set');
 
     // Move to Drive folder
     const orgRef = doc(db, 'organizations', organizationId);

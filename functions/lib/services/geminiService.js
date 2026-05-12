@@ -100,13 +100,14 @@ Extract the following information:
    - Total price for that item (quantity × unit price using sale price)
    - Brief description if available
 7. Order total - CRITICALLY IMPORTANT:
-   - Extract the FINAL total amount after ALL discounts, coupons, and taxes
-   - Look for labels like: "Total", "Grand Total", "Order Total", "Total (I.V.A. Incluido)", "Total including tax", "Final Total"
-   - DO NOT use intermediate subtotals like "Products", "Subtotal", "Items", "Merchandise", "Productos"
-   - If you see both a products subtotal AND a final total, use the FINAL total (usually at the bottom)
-   - The final total should reflect all discounts/coupons applied
+   - Extract the PRODUCTS SUBTOTAL (orange/colored number or "Productos" label) as DEFAULT
+   - This is the sum of product prices BEFORE discounts/coupons
+   - On Shein: the ORANGE/colored number near the top
+   - On Amazon: labeled "Productos: $XX"
+   - ONLY fall back to the final "Total" if no products subtotal is visible
+   - NEVER use crossed-out/strikethrough numbers
 
-   🔴 🔴 🔴 CRITICAL: ALWAYS USE THE LOWEST NUMBER WHEN MULTIPLE TOTALS ARE SHOWN 🔴 🔴 🔴
+   🔴 🔴 🔴 CRITICAL: USE THE ORANGE/PRODUCTS SUBTOTAL AS DEFAULT. ONLY FALL BACK TO BLACK TOTAL IF NO ORANGE NUMBER EXISTS. 🔴 🔴 🔴
 
    ⚠️ CRITICAL PRICE EXTRACTION RULES:
 
@@ -125,19 +126,18 @@ Extract the following information:
    ✅ CORRECT: Original price $11.59 (crossed out), Sale price $4.58 → You extract $4.58
 
    🔴 SHEIN EDGE CASE (CRITICAL):
-   - Orange/colored number at top (e.g., $45.99) = Products subtotal BEFORE discount → IGNORE THIS - DO NOT USE
-   - Black "Total" text at bottom (e.g., $40.99) = Final total AFTER discount → USE THIS
-   - ALWAYS USE THE BOTTOM BLACK "TOTAL" NUMBER (it's lower after discounts)
+   - Orange/colored number at top (e.g., $45.99) = Products subtotal → USE THIS AS DEFAULT
+   - Black "Total" text at bottom (e.g., $40.99) = Final total after discount → ONLY use if NO orange number
+   - NEVER use crossed-out/strikethrough numbers
    - When you see MULTIPLE total amounts on a Shein screenshot:
-     * IGNORE the orange/colored number at the top (products subtotal)
-     * USE the black "Total" text at the bottom (final total)
-     * ALWAYS USE THE LOWEST NUMBER when multiple totals are shown
-     * The bottom total is AFTER discounts - this is what customer paid
+     * USE the orange/colored number at the top (products subtotal) — this is DEFAULT
+     * IGNORE the black "Total" text at the bottom (post-discount)
+     * Only fall back to black total if NO orange/colored number exists
 
    🔴 AMAZON EDGE CASE (CRITICAL):
-   - "Productos: US$68.66" = Products subtotal BEFORE discounts → IGNORE THIS - DO NOT USE
-   - "Total (I.V.A. Incluido): US$67.50" = Final total AFTER discounts → USE THIS
-   - ALWAYS USE THE "TOTAL (I.V.A. INCLUIDO)" NUMBER (it's lower after coupons/discounts)
+   - "Productos: US$68.66" = Products subtotal → USE THIS AS DEFAULT
+   - "Total (I.V.A. Incluido): US$67.50" = Final total after discounts → ONLY use if "Productos" not visible
+   - DEFAULT: Use "Productos" amount (sum of product prices)
 
    🔴 CRITICAL RULE #1: ONLY NUMBERS WITH DOLLAR SIGNS ($) ARE MONEY
    - Tracking numbers (e.g., "1234567890") = NOT MONEY, IGNORE
@@ -181,16 +181,17 @@ Before you return your JSON, STOP and validate:
 ✓ Step B: Identify crossed-out/strikethrough prices and IGNORE them (original prices)
 ✓ Step C: Which amounts are labeled "Total", "Order Total", "Grand Total"? List them ALL
 ✓ Step D: Which "Total" is at the BOTTOM of the screenshot? (This is usually the final amount)
-✓ Step E: Compare ALL "Total" amounts - which is LOWEST?
-  - Orange $45.99 vs Black "Total" $40.99 → USE $40.99 (LOWEST BLACK TOTAL)
-  - "Productos" $68.66 vs "Total I.V.A." $67.50 → USE $67.50 (LOWEST FINAL TOTAL)
-  - SHEIN: Orange at top vs Black "Total" at bottom → ALWAYS USE BLACK BOTTOM TOTAL
-  - AMAZON: "Productos" vs "Total (I.V.A. Incluido)" → ALWAYS USE "Total (I.V.A. Incluido)"
-✓ Step F: Is your orderTotal the LOWEST "Total" amount? If NO, fix it now!
+✓ Step E: Is there an orange/colored number or "Productos" subtotal?
+  - If YES → USE IT as orderTotal (products subtotal is our default)
+  - Orange $45.99 vs Black "Total" $40.99 → USE $45.99 (ORANGE/products subtotal)
+  - "Productos" $68.66 vs "Total I.V.A." $67.50 → USE $68.66 (Productos)
+  - SHEIN: Orange at top vs Black "Total" at bottom → USE ORANGE
+  - AMAZON: "Productos" vs "Total (I.V.A. Incluido)" → USE "Productos"
+✓ Step F: Only fall back to black/bottom total if NO orange/products number exists. NEVER use crossed-out numbers!
 
-🔴 CRITICAL: orderTotal MUST be the LOWEST dollar amount labeled as "Total" on the screenshot!
-🔴 SHEIN: Use the BLACK "Total" text at bottom, NOT the orange number at top!
-🔴 AMAZON: Use "Total (I.V.A. Incluido)", NOT "Productos"!
+🔴 CRITICAL: orderTotal should be the ORANGE/products subtotal if visible. Only fall back to black total if no orange number exists!
+🔴 SHEIN: Use the ORANGE number at top (default). Only use black "Total" at bottom if no orange number!
+🔴 AMAZON: Use "Productos" (default). Only use "Total (I.V.A. Incluido)" if "Productos" not visible!
 
 ✓ Price Check: Did you use SALE prices (lowest price shown) for all items, ignoring crossed-out original prices?
 

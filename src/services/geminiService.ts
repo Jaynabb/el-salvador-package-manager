@@ -39,7 +39,7 @@ const extractWithOCR = async (base64Image: string): Promise<string> => {
  * Optimized for 95%+ accuracy on e-commerce order screenshots
  * This is the primary function to use for analyzing order screenshots
  */
-export const analyzeOrderScreenshot = async (base64Image: string): Promise<ExtractedOrderData> => {
+export const analyzeOrderScreenshot = async (base64Image: string, mimeType: string = 'image/png', lenient: boolean = false): Promise<ExtractedOrderData> => {
   const model = genAI.getGenerativeModel({
     model: 'gemini-2.5-flash',
     safetySettings: [
@@ -106,28 +106,42 @@ CRITICAL ACCURACY REQUIREMENTS:
 - Validate calculations before responding
 - COUNT THE DIGITS in any tracking number before extracting it!
 
-🔴 🔴 🔴 STEP 1: VERIFY THIS IS AN ACTUAL ORDER CONFIRMATION 🔴 🔴 🔴
+${lenient ? `🔴 STEP 1: EXTRACT ITEMS FROM THIS SCREENSHOT 🔴
+
+This screenshot comes from a Word document import. Extract ALL product/item information visible.
+
+✅ EXTRACT data from ANY of these screenshot types:
+- Order confirmations ("Order Confirmation", "Your Order", etc.)
+- Order history / purchase history pages
+- Delivered item pages ("ENTREGADO", "Delivered", "Entregado")
+- Order details pages ("Ver detalles", "Order Details")
+- Product listings with prices (even cart pages or wishlists)
+- Any page showing items with names and prices
+
+Only REJECT completely unrelated images:
+- Random photos (garage doors, street signs, vehicles, buildings)
+- Spreadsheets, calendars, schedules with no product info
+- Screenshots of the ImportFlow app itself
+
+If the screenshot shows ANY products with prices, EXTRACT THEM.` : `🔴 🔴 🔴 STEP 1: VERIFY THIS IS AN ACTUAL ORDER CONFIRMATION 🔴 🔴 🔴
 
 BEFORE extracting ANY data, verify this screenshot is an ACTUAL ORDER CONFIRMATION.
 
-✅ VALID ORDER CONFIRMATIONS have these indicators:
-- "Order Confirmation", "Order Receipt", "Order Details", "Your Order" header
-- Shows a TOTAL amount paid (labeled "Total:", "Order Total:", "Grand Total:", etc.)
-- Has a shipping/delivery address with customer name
-- Shows order number or tracking number
-- From a known retailer (Amazon, Shein, Walmart, eBay, AliExpress, Temu, etc.)
-- Shows purchased items with individual prices
+✅ VALID screenshots to extract from:
+- Order confirmations ("Order Confirmation", "Order Receipt", "Your Order")
+- Order history / purchase history pages showing completed orders
+- Delivered item pages ("ENTREGADO", "Delivered")
+- Order details pages ("Ver detalles", "Order Details")
+- Any page showing purchased items with prices from any retailer
 
 ❌ REJECT these screenshots (return null/empty data):
 - Google Shopping search results (shows "Google Shopping" at top, has "Search" bar)
-- Product listing pages (shows multiple products to buy, no order placed yet)
-- Shopping cart pages (shows cart, no order confirmed yet)
 - Random photos (garage doors, street signs, sidewalks, vehicles, buildings, etc.)
-- Websites or apps that are NOT order confirmations
+- Websites or apps with NO product/order information
 - Spreadsheets, calendars, schedules
 - Screenshots of the ImportFlow app itself
 
-🔴 IF THE SCREENSHOT IS NOT AN ORDER CONFIRMATION:
+🔴 IF THE SCREENSHOT HAS NO ORDER/PRODUCT INFORMATION:
 Return this JSON with null/empty values:
 {
   "customerName": null,
@@ -140,29 +154,9 @@ Return this JSON with null/empty values:
   "items": [],
   "orderTotal": 0,
   "totalPieces": 0
-}
+}`}
 
-🔴 EXAMPLES OF WHAT TO REJECT:
-
-Example 1 - Google Shopping (REJECT):
-- Shows "Google Shopping" at top
-- Has search bar with product name
-- Shows multiple products with "Buy" buttons
-- NO order confirmation, NO shipping address
-→ Return null/empty JSON
-
-Example 2 - Random photo (REJECT):
-- Photo of a garage door, street sign, vehicle, building, etc.
-- No prices, no order information
-→ Return null/empty JSON
-
-Example 3 - Product listing (REJECT):
-- Shows a single product page from Amazon/eBay
-- Has "Add to Cart" or "Buy Now" button
-- NO order confirmation header
-→ Return null/empty JSON
-
-✅ ONLY PROCEED TO EXTRACT DATA IF THIS IS A CONFIRMED ORDER SCREENSHOT ✅
+✅ PROCEED TO EXTRACT DATA ✅
 
 WHAT TO EXTRACT:
 
@@ -173,125 +167,27 @@ WHAT TO EXTRACT:
    - Return full name exactly as shown
    - If not visible: null
 
-2. **COMPANY/SELLER** 🔴 CRITICAL: ONLY extract Amazon, Shein, or Temu!
+2. **COMPANY/SELLER** - Extract the PLATFORM name, not vendor/seller names on line items.
 
-   🔴 🔴 🔴 VALID COMPANIES: Only these 3 platforms are used:
-   - **Amazon** - Amazon.com orders
-   - **Shein** - Shein.com orders
-   - **Temu** - Temu.com orders
+   This platform handles orders from ANY retailer worldwide. There is NO restricted list.
 
-   🔴 IGNORE all other platforms - If screenshot is NOT from Amazon/Shein/Temu → company = null
+   STEP 1: Scan for platform text, logos, URLs, or branding anywhere on the screenshot.
+   - Look at the header, footer, URL bar, logos, and watermarks
+   - Screenshots may be in English, Spanish, or any language
 
-   ⚠️ THE PROBLEM:
-   - These marketplaces show vendor/supplier names on product line items
-   - Example: Shein order screenshot shows "Ray's Playhouse" as the vendor for a product
-   - You MUST extract "Shein" (the platform), NOT "Ray's Playhouse" (the vendor on the line item)
+   STEP 2: If no text branding found, identify by visual design (colors, layout, UI patterns).
 
-   🔴 STEP-BY-STEP PROCESS TO IDENTIFY THE PLATFORM:
+   STEP 3: Extract the PLATFORM name — the website/app where the order was placed.
+   - Capitalize properly (e.g., "Shein" not "SHEIN", "Amazon" not "amazon")
+   - If truly unrecognizable → company = null
 
-   STEP 1: Look at the OVERALL DESIGN of the screenshot
-   - What does the header/top of the page look like?
-   - What colors dominate the design?
-   - What is the layout style and UI design?
-   - Is there a logo at the top?
-
-   STEP 2: Check for SPECIFIC TEXT FIRST (highest priority - in English or Spanish):
-
-   🔴 FIRST, scan the ENTIRE screenshot for these specific text strings:
-   - If you see "SHEIN", "Shein", "shein.com", "us.shein.com" ANYWHERE → company = "Shein"
-   - If you see "Amazon", "amazon.com", "Amazon.com" ANYWHERE → company = "Amazon"
-   - If you see "Temu", "temu.com" ANYWHERE → company = "Temu"
-   - If you see ANY OTHER company name → company = null (only Amazon/Shein/Temu accepted)
-
-   STEP 3: If no clear text branding found, match by VISUAL DESIGN (only these 3):
-
-   **SHEIN** - Black/white modern design:
-   - TEXT MARKERS:
-     * "SHEIN" text or logo ANYWHERE on screenshot
-     * "shein.com" or "us.shein.com" in URL
-   - VISUAL MARKERS:
-     * Predominantly BLACK header/top bar
-     * Black and white color scheme
-     * Very clean, modern, minimalist UI
-     * Product images in a grid with white background
-     * Modern fashion aesthetic
-   - UNIQUE TO SHEIN:
-     * Shows vendor/store names like "Ray's Playhouse", "SHEIN LUNE CURVE" on line items ← IGNORE vendor names!
-     * Modern app-style interface
-   - Spanish screenshots may show "SHEIN" branding
-
-   **AMAZON** - Blue/orange design:
-   - TEXT MARKERS:
-     * "Amazon" text or smile logo
-     * "amazon.com" in URL
-   - VISUAL MARKERS:
-     * Orange/yellow "Amazon" logo with smile arrow
-     * Dark blue navigation bar at top
-     * "Ships from" and "Sold by" labels showing third-party sellers ← IGNORE seller names!
-     * Distinctive Amazon order confirmation layout
-     * Orange "Add to Cart" or "Buy Now" buttons
-     * Very structured, grid-like product display
-
-   **TEMU** - Orange/white vibrant design:
-   - TEXT MARKERS:
-     * "Temu" branding anywhere
-     * "temu.com" in URL
-   - VISUAL MARKERS:
-     * Bright ORANGE and white branding
-     * "Shop Like a Billionaire" or similar slogans
-     * Very aggressive pricing display
-     * Countdown timers and flash sale banners
-     * Modern, app-style interface with orange theme
-
-   STEP 4: Make your final decision and validate:
-
-   🔴 DECISION TREE (ONLY these 3 companies accepted):
-   1. Did you find "SHEIN" text anywhere? → company = "Shein" ✅
-   2. Did you find "Amazon" text anywhere? → company = "Amazon" ✅
-   3. Did you find "Temu" text anywhere? → company = "Temu" ✅
-   4. No text found? Look at design:
-      - BLACK header + clean design + fashion items = "Shein" ✅
-      - BLUE header + smile logo area = "Amazon" ✅
-      - ORANGE + "Shop Like..." = "Temu" ✅
-   5. Not from Amazon/Shein/Temu? → company = null ✅
-
-   🔴 BEFORE YOU FINALIZE - ASK YOURSELF:
-   - Did I look for text branding FIRST before relying on colors?
-   - Is this from Amazon, Shein, or Temu? (ONLY these 3 accepted)
-   - If I see vendor names like "Ray's Playhouse" or "SHEIN LUNE CURVE", am I extracting the PLATFORM (Shein) not the vendor?
+   🔴 CRITICAL RULE: Extract the PLATFORM, not vendor/seller/brand names on line items.
+   - Marketplaces (Amazon, eBay, Shein, Temu, Walmart, AliExpress, etc.) show third-party sellers — IGNORE seller names, extract the marketplace name
+   - Example: eBay order from seller "AutoPartsDepot" → company = "eBay" (the platform)
+   - Example: Amazon order sold by "BestDeals123" → company = "Amazon" (the platform)
+   - Example: Shein order from "Ray's Playhouse" → company = "Shein" (the platform)
+   - Direct retailers (Nike.com, BestBuy, HomeDepot, etc.) → use the retailer name
    - Screenshot in Spanish? That's normal for El Salvador - extract data anyway!
-
-   ✅ CORRECT EXAMPLES:
-   - Shein screenshot (Spanish), product from "SHEIN LUNE CURVE" → company = "Shein" ✅
-   - Shein screenshot, product from "Ray's Playhouse" → company = "Shein" ✅
-   - Amazon screenshot, sold by "BestDeals123" → company = "Amazon" ✅
-   - Temu screenshot, aggressive pricing → company = "Temu" ✅
-
-   ❌ WRONG EXAMPLES (DO NOT DO THIS):
-   - Shein screenshot, product from "Ray's Playhouse" → company = "Ray's Playhouse" ❌ WRONG!
-   - Amazon screenshot, sold by "BestDeals123" → company = "BestDeals123" ❌ WRONG!
-   - eBay screenshot → company = "eBay" ❌ WRONG! (not in accepted list)
-
-   🔴 CRITICAL RULES:
-   - Look at the ENTIRE screenshot's design, not just product line items
-   - Vendor/supplier names appear IN THE MIDDLE of the page (on product listings) - IGNORE THEM
-   - Platform branding appears at the TOP (header, logo, URL) - USE THIS
-   - If you see a vendor name like "Ray's Playhouse", ask yourself: "What platform is this screenshot from?"
-   - Even if the logo isn't visible, identify the platform by layout, colors, and design patterns
-   - The platform is WHERE the customer placed the order, not who manufactured/supplied the item
-
-   VALID PLATFORMS (use exactly these names):
-   - "Shein" - for Shein.com orders (ignore line item vendors like "Ray's Playhouse")
-   - "Amazon" - for Amazon.com orders (ignore "Sold by" sellers)
-   - "AliExpress" - for AliExpress orders (ignore store names)
-   - "Temu" - for Temu.com orders
-   - "eBay" - for eBay.com orders (ignore seller usernames)
-   - "Walmart" - for Walmart.com orders (ignore third-party sellers)
-   - "Target" - for Target.com orders
-   - Other direct retailers: "Nike.com", "BestBuy", "HomeDepot", etc.
-
-   - Standardize: Capitalize properly (e.g., "Shein" not "SHEIN" or "shein")
-   - If platform cannot be identified from design: null
 
 3. **ORDER & TRACKING**
 
@@ -518,74 +414,78 @@ WHAT TO EXTRACT:
    ❌ WRONG: Screenshot has tracking "9876543210" and you add 9876543210 to total
    ✅ CORRECT: You ignore it completely - tracking numbers are NOT money
 
-   🔴 🔴 🔴 MOST IMPORTANT RULE: ALWAYS USE THE LOWEST/FINAL TOTAL SHOWN 🔴 🔴 🔴
+   🔴 🔴 🔴 MOST IMPORTANT RULE: USE THE ORANGE/PRODUCTS SUBTOTAL AS DEFAULT 🔴 🔴 🔴
 
    ⚠️ CRITICAL: When you see MULTIPLE dollar amounts on a screenshot:
-   - IGNORE intermediate subtotals (products, items, merchandise)
-   - IGNORE higher numbers (these are BEFORE discounts)
-   - USE THE LOWEST NUMBER labeled as "Total" (this is AFTER discounts)
-   - The lowest "Total" number is what the customer ACTUALLY PAID
+   - PREFER the orange/colored number or "Productos" subtotal (sum of product prices)
+   - Only fall back to the black "Total" if no orange/products number is visible
+   - NEVER use crossed-out/strikethrough numbers
+   - The orange/products subtotal is what the items are worth BEFORE coupons
 
    🔴 SHEIN SCREENSHOTS - SPECIAL ATTENTION:
-   - Orange/colored number at top = Products subtotal BEFORE discount → IGNORE THIS
-   - Black "Total" text at bottom = Final total AFTER discount → USE THIS
-   - ALWAYS USE THE BOTTOM BLACK "TOTAL" NUMBER (it's lower)
+   - Orange/colored number at top = Products subtotal (sum of items) → USE THIS AS DEFAULT
+   - Black "Total" text at bottom = Final total after discounts → ONLY use if NO orange number exists
+   - NEVER use crossed-out/strikethrough numbers
+   - DEFAULT: Use the ORANGE/colored number (products subtotal)
+   - FALLBACK: Use the black "Total" only if no orange/colored number is visible
 
    🔴 AMAZON SCREENSHOTS - SPECIAL ATTENTION:
-   - "Productos: $XX" = Products subtotal BEFORE discounts → IGNORE THIS
-   - "Total (I.V.A. Incluido): $XX" = Final total AFTER discounts → USE THIS
-   - ALWAYS USE THE "TOTAL (I.V.A. INCLUIDO)" NUMBER (it's lower after discounts)
+   - "Productos: $XX" = Products subtotal → USE THIS AS DEFAULT
+   - "Total (I.V.A. Incluido): $XX" = Final total after discounts → ONLY use if "Productos" is not visible
+   - DEFAULT: Use "Productos" amount (sum of product prices)
 
    ORDER TOTAL EXTRACTION (CRITICAL):
-   Step 1: Look for the FINAL/GRAND TOTAL on the screenshot
-   - Search for labels like: "Total", "Order Total", "Grand Total", "Amount Due", "Total Price", "Total (I.V.A. Incluido)", "Total including tax"
+   Step 1: Look for the PRODUCTS SUBTOTAL (orange/colored number or "Productos" label)
+   - This is the SUM of all product prices BEFORE discounts/coupons
+   - On Shein: this is the ORANGE/colored number near the top
+   - On Amazon: this is labeled "Productos: $XX"
    - MUST have a $ symbol to be considered money
-   - This total includes taxes, fees, shipping, and discounts
-   - ⚠️ This is the ACTUAL amount the customer paid
-   - 🔴 DO NOT use "Productos" or "Products" - this is the subtotal BEFORE discounts!
-   - 🔴 If you see both "Productos: $X" and "Total (I.V.A. Incluido): $Y", use $Y (the FINAL total with discounts and taxes)
-   - 🔴 If you see an orange/colored number and a black "Total" number, use the black "Total" (it's lower)
+   - 🔴 USE THIS NUMBER AS DEFAULT — it represents what the items are worth
 
-   Step 2: If you find a final total, USE IT as orderTotal
-   - Example: If items are $5 each but bottom shows "Total: $7.00", use $7.00
-   - The extra $2 is taxes/fees - we want the FULL amount including everything
+   Step 2: If you find a products subtotal, USE IT as orderTotal
+   - Example: Orange text shows $45.99, black "Total" shows $40.99 → USE $45.99
+   - Example: "Productos: $68.66", "Total (I.V.A. Incluido): $67.50" → USE $68.66
 
-   Step 3: If NO final total is visible, then calculate it:
+   Step 3: If NO products subtotal is visible, THEN use the final total
+   - Look for "Total", "Order Total", "Grand Total" etc.
+   - This is your fallback if no products subtotal is shown
+
+   Step 4: If NO total of any kind is visible, calculate it:
    - Add up all item totalValue amounts (quantity × unitValue using sale price)
-   - This is your fallback if no total is shown
+   - This is your last-resort fallback
 
    🔴 CRITICAL EXAMPLES:
 
-   Example 1 - Final total is visible (PREFERRED):
+   Example 1 - Products subtotal is visible (PREFERRED):
    - Item 1: $2.00
    - Item 2: $3.00
-   - Subtotal: $5.00
+   - **Subtotal/Products: $5.00** ← USE THIS NUMBER (products subtotal)
    - Tax: $1.50
    - Shipping: $0.50
-   - **TOTAL: $7.00** ← USE THIS NUMBER
-   - orderTotal = $7.00 (NOT $5.00)
+   - Total: $7.00
+   - orderTotal = $5.00 (the products subtotal, NOT the final total with tax/shipping)
 
    Example 2 - Amazon order with discounts (CRITICAL EDGE CASE):
-   - Productos: US$68.66 (products subtotal BEFORE discounts) ← DO NOT USE THIS
+   - **Productos: US$68.66** (products subtotal) ← USE THIS NUMBER (default)
    - Envío: US$0.00 (shipping)
    - Sus cupones de ahorro: -US$1.29 (discount 1)
    - Sus cupones de ahorro: -US$3.70 (discount 2)
    - Total antes de impuestos: US$63.67 (after discounts, before tax)
    - Impuestos: US$3.83 (tax)
-   - **Total (I.V.A. Incluido): US$67.50** ← USE THIS NUMBER (final total after discounts and taxes)
-   - orderTotal = $67.50 (NOT $68.66)
+   - Total (I.V.A. Incluido): US$67.50 ← DO NOT USE (only use if "Productos" is not visible)
+   - orderTotal = $68.66 (the Productos subtotal)
 
    🔴 🔴 🔴 Example 3 - Shein order with multiple totals (CRITICAL EDGE CASE):
-   - **ORANGE TEXT at top: $45.99** (products subtotal) ← DO NOT USE THIS - IGNORE ORANGE NUMBER
+   - **ORANGE TEXT at top: $45.99** (products subtotal) ← USE THIS NUMBER (default)
    - Shipping: $0.00
    - Discount: -$5.00
-   - **BLACK TEXT "Total" at bottom: $40.99** ← USE THIS NUMBER (final total after discounts)
-   - orderTotal = $40.99 (NOT $45.99)
+   - **BLACK TEXT "Total" at bottom: $40.99** ← DO NOT USE (only use if no orange number)
+   - orderTotal = $45.99 (the ORANGE products subtotal)
    - 🔴 CRITICAL RULE: When you see MULTIPLE total amounts on a Shein screenshot:
-     * IGNORE the orange/colored number at the top (products subtotal)
-     * USE the black "Total" text at the bottom (final total)
-     * ALWAYS USE THE LOWEST NUMBER when multiple totals are shown
-     * The bottom total is AFTER discounts - this is what customer paid
+     * USE the orange/colored number at the top (products subtotal) — this is DEFAULT
+     * IGNORE the black "Total" text at the bottom (post-discount)
+     * NEVER use crossed-out/strikethrough numbers
+     * Only fall back to black total if NO orange number exists
 
    Example 4 - No final total visible (FALLBACK):
    - Item 1: 2 × $4.58 = $9.16
@@ -595,14 +495,14 @@ WHAT TO EXTRACT:
    - orderTotal = $9.16 + $12.99 + $16.80 = $38.95
 
    ❌ WRONG APPROACH:
-   - Screenshot shows items total $5.00 and final total $7.00
-   - You use $5.00 ← THIS IS WRONG
-   - ✅ You should use $7.00 (the final total with taxes/fees)
+   - Screenshot shows orange $45.99 and black "Total" $40.99
+   - You use $40.99 ← THIS IS WRONG
+   - ✅ You should use $45.99 (the orange/products subtotal)
 
    ❌ WRONG APPROACH #2 (CRITICAL):
    - Screenshot shows "Productos: $68.66" and "Total (I.V.A. Incluido): $67.50"
-   - You use $68.66 ← THIS IS WRONG (that's the subtotal before discounts!)
-   - ✅ You should use $67.50 (the FINAL total after discounts and taxes)
+   - You use $67.50 ← THIS IS WRONG
+   - ✅ You should use $68.66 (the Productos subtotal — our default)
 
    CALCULATING TOTAL PIECES:
    - Simply add up all item quantities
@@ -620,28 +520,15 @@ QUANTITY ACCURACY:
 - If same item appears multiple times, count each occurrence
 - ALWAYS sum quantities for totalPieces
 
-PLATFORM DETECTION - PRIORITY ORDER (ONLY Amazon, Shein, Temu):
+PLATFORM DETECTION:
+- Scan for text, logos, URLs, or branding to identify the platform (any retailer worldwide)
+- Extract the PLATFORM name, not vendor/seller/brand names
+- Capitalize properly. If unrecognizable → null
 
-🔴 STEP 1: SCAN FOR TEXT FIRST (highest priority - may be in Spanish):
-- Look for "SHEIN", "shein.com" → company = "Shein"
-- Look for "Amazon", "amazon.com" → company = "Amazon"
-- Look for "Temu", "temu.com" → company = "Temu"
-- ANY other company → company = null (ONLY these 3 accepted)
-
-🔴 STEP 2: IF NO TEXT, USE VISUAL CUES (Spanish screenshots OK):
-- **BLACK header + clean modern UI + fashion items** → "Shein"
-  ✅ Even if shows vendors like "SHEIN LUNE CURVE", "Ray's Playhouse" ← IGNORE vendor names!
-  ✅ Spanish screenshot? Still extract "Shein"
-- **BLUE header + orange smile logo area** → "Amazon"
-  ✅ Even if showing "Sold by [ThirdPartySeller]" ← IGNORE seller names!
-- **Bright ORANGE + modern UI + aggressive pricing** → "Temu"
-  ✅ Even if showing supplier names ← IGNORE supplier names!
-  ✅ "Shop Like a Billionaire" slogan
-
-🔴 KEY REMINDERS:
-- ONLY extract Amazon, Shein, or Temu (all others = null)
+KEY REMINDERS:
+- Extract the PLATFORM name, not vendor/seller names from line items
 - Spanish screenshots are normal for El Salvador
-- Extract PLATFORM from header/design, IGNORE vendor names in product listings
+- If you cannot identify the platform → company = null
 - Vendor names like "SHEIN LUNE CURVE", "Flirla CURVE" are NOT the platform - the platform is "Shein"
 
 Return this EXACT JSON format:
@@ -697,9 +584,10 @@ FINAL VALIDATION CHECKLIST - VERIFY BEFORE RESPONDING:
 ✓ Did you use SALE prices (lowest price shown) for all items?
 ✓ Did you IGNORE all crossed-out/original prices?
 ✓ Each item.totalValue = item.quantity × item.unitValue (using sale price)
-✓ 🔴 MOST IMPORTANT: Did you look for "Total", "Order Total", or "Grand Total" on the screenshot?
-✓ 🔴 If a final total is shown, did you use THAT number as orderTotal (not the sum of items)?
-✓ If NO final total is shown, orderTotal = sum of all item.totalValue values
+✓ 🔴 MOST IMPORTANT: Did you look for the ORANGE/colored number or "Productos" subtotal?
+✓ 🔴 If an orange/products subtotal is shown, did you use THAT number as orderTotal?
+✓ 🔴 Only fall back to black "Total" if no orange/products number exists
+✓ If NO total of any kind is shown, orderTotal = sum of all item.totalValue values
 ✓ totalPieces = sum of all item.quantity values
 ✓ Company name is properly capitalized
 ✓ Tracking last 4 matches the actual last 4 of tracking number
@@ -726,16 +614,16 @@ FINAL VALIDATION CHECKLIST - VERIFY BEFORE RESPONDING:
      - The bottom "Total" is usually the FINAL amount after all discounts
      - This is what customer ACTUALLY PAID
 
-   ✓ Step E: Compare ALL "Total" amounts - which is LOWEST?
-     - If you see $45.99 (orange) and $40.99 (black "Total" at bottom) → USE $40.99
-     - If you see $68.66 ("Productos") and $67.50 ("Total I.V.A.") → USE $67.50
-     - ALWAYS USE THE LOWEST "Total" amount
+   ✓ Step E: Is there an orange/colored number or "Productos" subtotal?
+     - If YES → USE IT as orderTotal (this is the products subtotal, our default)
+     - If you see $45.99 (orange) and $40.99 (black "Total" at bottom) → USE $45.99 (orange)
+     - If you see $68.66 ("Productos") and $67.50 ("Total I.V.A.") → USE $68.66 (Productos)
 
-   ✓ Step F: Final check - is your orderTotal the LOWEST "Total" amount on the screenshot?
-     - If NO, STOP and fix it immediately!
-     - If YES, proceed with that number
+   ✓ Step F: If NO orange/products subtotal exists, use the final "Total" amount
+     - Only fall back to the black/bottom total if no orange/products number is visible
+     - NEVER use crossed-out/strikethrough numbers
 
-   🔴 CRITICAL: Your orderTotal MUST be the LOWEST dollar amount labeled as "Total" on the screenshot!
+   🔴 CRITICAL: Your orderTotal should be the ORANGE/products subtotal if visible. Only fall back to black total if no orange number exists!
 
 2. 🔴 🔴 🔴 PHONE NUMBER CHECK - VERIFY YOUR TRACKING NUMBER RIGHT NOW:
    - Look at trackingNumber field you're about to return
@@ -763,14 +651,14 @@ FINAL VALIDATION CHECKLIST - VERIFY BEFORE RESPONDING:
 4. 🔴 PRICE CHECK: Did you accidentally add any numbers WITHOUT dollar signs to prices?
 5. Review each item - did you use the LOWEST price shown WITH A $ SYMBOL?
 6. 🔴 🔴 🔴 TOTAL CHECK - ALREADY VALIDATED IN STEP 1.5 ABOVE:
-   - You already compared ALL "Total" amounts and selected the LOWEST one
-   - You already verified that bottom "Total" is what you're using
+   - You already checked for orange/products subtotal and used it if visible
+   - You only used the black "Total" if no orange/products number was found
    - If you skipped step 1.5, GO BACK and do it now!
 
-7. 🔴 DOUBLE-CHECK: Is your orderTotal the LOWEST "Total" shown on the screenshot?
+7. 🔴 DOUBLE-CHECK: Is your orderTotal the ORANGE/products subtotal (if visible)?
    - List all "Total" amounts again: ________
    - Your orderTotal: ________
-   - Is it the LOWEST? If NO, fix it immediately!
+   - Is it the orange/products subtotal? If orange exists and you used black, fix it immediately!
 
 8. 🔴 FINAL CHECK: Does your orderTotal look reasonable? (If it's in millions/billions, you added a tracking number by mistake)
 
@@ -780,7 +668,7 @@ Return ONLY valid JSON, no markdown, no extra text.`;
     prompt,
     {
       inlineData: {
-        mimeType: 'image/png',
+        mimeType: mimeType,
         data: base64Image
       }
     }
@@ -981,6 +869,184 @@ Return ONLY valid JSON, no markdown, no extra text.`;
 };
 
 /**
+ * Extract orders from a Machote-style Word doc that contains embedded screenshots.
+ * Parses the HTML to split customer blocks, extracts metadata (name, package#, carrier, value),
+ * then runs analyzeOrderScreenshot on each embedded image.
+ */
+export interface MachoteCustomer {
+  name: string;
+  packageNumber: string;
+  carrier: string;
+  trackingLast4: string;
+  value: number;
+  items: PackageItem[];
+  screenshotBase64s: string[]; // base64 data URIs of embedded images
+  totalPieces: number;
+  orderTotal: number;
+}
+
+export const extractOrdersFromMachoteDoc = async (
+  docHtml: string,
+  onProgress?: (current: number, total: number) => void
+): Promise<MachoteCustomer[]> => {
+  // Split HTML into customer blocks by looking for name/Paquete patterns
+  // The Machote doc has patterns like: "NOMBRE DEL CLIENTE" or customer names before "Paquete #N"
+  // We'll split on strong/bold text that precedes package info
+
+  // Extract all image data URIs from the HTML
+  const allImages: { index: number; src: string }[] = [];
+  const imgRegex = /<img[^>]+src="(data:image\/[^"]+)"[^>]*>/gi;
+  let imgMatch;
+  while ((imgMatch = imgRegex.exec(docHtml)) !== null) {
+    allImages.push({ index: imgMatch.index, src: imgMatch[1] });
+  }
+  console.log(`📄 Machote doc: found ${allImages.length} embedded images`);
+
+  // Look for customer block patterns - split on "Paquete #N" occurrences
+  // Pattern: Customer Name ... Paquete #N ... carrier + tracking ... VALOR $XX.XX
+  const blockRegex = /(?:Paquete\s*#?\s*(\d+))/gi;
+  const blockPositions: { index: number; packageNum: string }[] = [];
+  let blockMatch;
+  while ((blockMatch = blockRegex.exec(docHtml)) !== null) {
+    blockPositions.push({ index: blockMatch.index, packageNum: blockMatch[1] });
+  }
+  console.log(`📄 Found ${blockPositions.length} package blocks`);
+
+  if (blockPositions.length === 0) {
+    throw new Error('No "Paquete #" patterns found in document. This may not be a Machote-format document.');
+  }
+
+  // For each block, extract the surrounding text to find metadata
+  const customers: MachoteCustomer[] = [];
+
+  for (let i = 0; i < blockPositions.length; i++) {
+    const blockStart = blockPositions[i].index;
+    const blockEnd = i + 1 < blockPositions.length ? blockPositions[i + 1].index : docHtml.length;
+    const blockHtml = docHtml.substring(
+      // Look back up to 500 chars before "Paquete" to capture the customer name
+      Math.max(0, blockStart - 500),
+      blockEnd
+    );
+
+    // Strip HTML tags for text-based regex matching
+    const blockText = blockHtml.replace(/<[^>]+>/g, ' ').replace(/&[^;]+;/g, ' ').replace(/\s+/g, ' ');
+
+    // Extract customer name - typically bold text before "Paquete"
+    // Look for the name in the text before "Paquete"
+    const paqueteIdx = blockText.indexOf('Paquete');
+    const textBeforePaquete = paqueteIdx > 0 ? blockText.substring(0, paqueteIdx).trim() : '';
+
+    // The customer name is usually the last significant text before Paquete
+    // Try to extract from bold tags in original HTML
+    let customerName = 'Unknown';
+    const nameBeforePaquete = blockHtml.substring(0, blockHtml.indexOf('Paquete'));
+    const boldNames = nameBeforePaquete.match(/<strong>([^<]+)<\/strong>/gi);
+    if (boldNames && boldNames.length > 0) {
+      // Get the last bold text before Paquete
+      const lastBold = boldNames[boldNames.length - 1].replace(/<\/?strong>/gi, '').trim();
+      if (lastBold.length > 1 && lastBold.length < 60) {
+        customerName = lastBold;
+      }
+    }
+    // Fallback: look for capitalized name patterns in text before Paquete
+    if (customerName === 'Unknown' && textBeforePaquete) {
+      // Look for words that look like names (capitalized, 2+ words)
+      const nameMatch = textBeforePaquete.match(/([A-Z][a-zA-záéíóúñÁÉÍÓÚÑ]+(?:\s+[A-Z][a-zA-záéíóúñÁÉÍÓÚÑ]+)+)\s*$/);
+      if (nameMatch) {
+        customerName = nameMatch[1].trim();
+      }
+    }
+
+    const packageNumber = blockPositions[i].packageNum;
+
+    // Extract carrier + tracking last 4 - format is "USPS #9728" or "FedEx #2824" or "SpeedX #9359"
+    const carrierTrackingMatch = blockText.match(/\b(USPS|UPS|FedEx|DHL|Amazon\s*Logistics?|OnTrac|LaserShip|SpeedX)\s*#?\s*(\d{4})\b/i);
+    const carrier = carrierTrackingMatch ? carrierTrackingMatch[1] : '';
+    const trackingLast4 = carrierTrackingMatch ? carrierTrackingMatch[2] : '';
+
+    // Extract VALOR (value) - also handles "VAR:" typo
+    const valorMatch = blockText.match(/VALO?R\s*:?\s*\$?\s*([\d,]+\.?\d*)/i) ||
+      blockText.match(/\$\s*([\d,]+\.?\d*)/);
+    const value = valorMatch ? parseFloat(valorMatch[1].replace(',', '')) : 0;
+
+    // Find images that belong to this block (between this block start and next block start)
+    const blockImages = allImages.filter(img =>
+      img.index >= (blockStart - 500) && img.index < blockEnd
+    );
+
+    customers.push({
+      name: customerName,
+      packageNumber: `Paquete #${packageNumber}`,
+      carrier,
+      trackingLast4,
+      value,
+      items: [],
+      screenshotBase64s: blockImages.map(img => img.src),
+      totalPieces: 0,
+      orderTotal: value,
+    });
+  }
+
+  // Now process all screenshots through Gemini vision with concurrency limit
+  const CONCURRENCY = 4;
+  let totalScreenshots = customers.reduce((sum, c) => sum + c.screenshotBase64s.length, 0);
+  let processedCount = 0;
+
+  console.log(`📸 Processing ${totalScreenshots} screenshots across ${customers.length} customers...`);
+
+  for (const customer of customers) {
+    if (customer.screenshotBase64s.length === 0) continue;
+
+    const allItems: PackageItem[] = [];
+
+    // Process images in batches of CONCURRENCY
+    for (let j = 0; j < customer.screenshotBase64s.length; j += CONCURRENCY) {
+      const batch = customer.screenshotBase64s.slice(j, j + CONCURRENCY);
+      const results = await Promise.allSettled(
+        batch.map(async (imgSrc) => {
+          // Extract mime type and base64 data from data URI
+          const dataMatch = imgSrc.match(/^data:(image\/[^;]+);base64,(.+)$/);
+          if (!dataMatch) return null;
+          const imgMimeType = dataMatch[1];
+          const base64Data = dataMatch[2];
+          return analyzeOrderScreenshot(base64Data, imgMimeType);
+        })
+      );
+
+      for (const result of results) {
+        processedCount++;
+        if (onProgress) onProgress(processedCount, totalScreenshots);
+
+        if (result.status === 'fulfilled' && result.value) {
+          const extracted = result.value;
+          if (extracted.items && extracted.items.length > 0) {
+            allItems.push(...extracted.items);
+          }
+          // Pick up carrier from screenshot if not found in text
+          if (!customer.carrier && extracted.carriers && extracted.carriers.length > 0) {
+            customer.carrier = extracted.carriers[0];
+          }
+        } else if (result.status === 'rejected') {
+          console.warn(`⚠️ Screenshot extraction failed for ${customer.name}:`, result.reason);
+        }
+      }
+    }
+
+    customer.items = allItems;
+    customer.totalPieces = allItems.reduce((s, item) => s + (item.quantity || 0), 0);
+    // Use extracted item total if we have items, otherwise keep the VALOR from the doc
+    if (allItems.length > 0) {
+      const itemsTotal = allItems.reduce((s, item) => s + (item.totalValue || 0), 0);
+      // Use the higher of document VALOR or items total (VALOR is authoritative)
+      customer.orderTotal = customer.value > 0 ? customer.value : itemsTotal;
+    }
+  }
+
+  console.log(`✅ Machote extraction complete: ${customers.length} customers, ${processedCount} screenshots processed`);
+  return customers;
+};
+
+/**
  * Extract order items from Word document text.
  * Used when a customer sends a Word doc listing their items.
  */
@@ -1003,19 +1069,25 @@ export const extractItemsFromDocText = async (docText: string, customerName?: st
   });
 
   const prompt = `You are extracting item data from a Word document for El Salvador customs declarations.
+The output must match EXACTLY the same format as screenshot-based order extraction.
 
 The document contains a list of items that a customer is importing. Extract ALL items with their details.
 
 RULES:
 - Extract EVERY item mentioned in the document
-- For each item: name, quantity, unit price, total price, category
+- For each item you MUST provide ALL of these fields:
+  * name: full item name as written in the document
+  * description: brief description of the item (what it is, material, notable features)
+  * customsDescription: SHORT Spanish customs description (3-5 words max): item type + color ONLY. NO brand names, NO marketing text, NO sizes. Examples: 'Calzoncillos Boxer Negro', 'Vestido Rojo Mujer', 'Consola Juegos Portátil'. If item is in English, translate to Spanish.
+  * quantity: number of pieces (default 1 if not specified)
+  * unitValue: price per single unit in USD
+  * totalValue: quantity × unitValue
+  * category: one of: electronics, clothing, toys, food, accessories, cosmetics, footwear, home goods, other
 - If the document lists multiple customers/consignees, group items by customer
 - If no customer name is found in the document, use "${customerName || 'Unknown'}" as the customer name
 - Prices should be in USD. If no currency specified, assume USD.
-- Quantity defaults to 1 if not specified
-- Calculate totalValue = quantity × unitValue
-- Generate a SHORT Spanish customs description for each item (3-5 words: item type + color only)
-- Category: electronics, clothing, toys, food, accessories, cosmetics, footwear, home goods, other
+- orderTotal = sum of all item totalValues
+- totalPieces = sum of all item quantities
 
 Return this EXACT JSON format:
 {
@@ -1025,6 +1097,7 @@ Return this EXACT JSON format:
       "items": [
         {
           "name": "full item name from document",
+          "description": "brief description of item",
           "customsDescription": "Short Spanish customs description (e.g., 'Calzoncillos Boxer Negro')",
           "quantity": 1,
           "unitValue": 10.00,

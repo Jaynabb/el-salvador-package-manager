@@ -9,16 +9,16 @@ import type { Organization } from '../types';
  * Exports orders to Google Docs in the specified format
  */
 
-// Fixed screenshot size for Machote export: 3.11" × 4.01" (per user specification).
+// Fixed screenshot size for Machote export: ~6" × 8" (1 image per page).
 // Every image is normalized to this exact size via canvas before insertion.
-// 2 images fit per page with the header text.
-const IMG_WIDTH_PT = 223.92;  // 3.11 inches × 72
-const IMG_HEIGHT_PT = 288.72; // 4.01 inches × 72
-const CANVAS_WIDTH = Math.round(IMG_WIDTH_PT * 2);   // 448px (2x for retina)
-const CANVAS_HEIGHT = Math.round(IMG_HEIGHT_PT * 2);  // 578px
+// 1 image per page with the header text.
+const IMG_WIDTH_PT = 432;   // 6 inches × 72
+const IMG_HEIGHT_PT = 576;  // 8 inches × 72
+const CANVAS_WIDTH = 864;   // 2x for retina (432 × 2)
+const CANVAS_HEIGHT = 1152; // 2x for retina (576 × 2)
 
 /**
- * Normalize an image to exact 3.11" × 4.01" dimensions.
+ * Normalize an image to exact 6" × 8" dimensions.
  * Fetches the image, draws it center-fit on a portrait canvas, uploads the result.
  * Every image in the Machote will be exactly the same size — no variation.
  */
@@ -351,6 +351,23 @@ const createNewDocument = async (
     );
   }
 
+  // Make accessible via link (works in incognito / different accounts)
+  try {
+    await fetch(
+      `https://www.googleapis.com/drive/v3/files/${docId}/permissions`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ role: 'writer', type: 'anyone' }),
+      },
+    );
+  } catch (err) {
+    console.warn('Failed to set sharing permissions:', err);
+  }
+
   return docId;
 };
 
@@ -399,9 +416,8 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
     });
   };
 
-  // Helper to insert image within 465×580 PT bounding box.
-  // Landscape images fill the width, portrait images fill the height.
-  // Either way, the image + header always fits on one page (no blank pages).
+  // Helper to insert image at 6"×8" (432×576 PT).
+  // 1 image per page with the text header.
   const insertImage = (imageUrl: string) => {
     requests.push({
       insertInlineImage: {
@@ -456,11 +472,9 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
       insertText('\n');
     }
 
-    // 2. Package Number - stripped to digits only ("Paquete #1" → "1")
-    if (order.packageNumber) {
-      const pkgNum = order.packageNumber.replace(/\D+/g, '') || order.packageNumber;
-      insertText(`${pkgNum}\n`);
-    }
+    // 2. Package Number - renumbered sequentially (1, 2, 3...) after alphabetical sort
+    const pkgNum = String(orderIndex + 1);
+    insertText(`${pkgNum}\n`);
 
     // 3. Carrier + Tracking (last 4 digits) - uses exact values from table
     // Tracking: Uses order.trackingNumber if manually entered, otherwise falls back to merchantTrackingNumber
@@ -482,18 +496,16 @@ const buildOrderDocumentRequests = async (orders: OrderRow[], accessToken: strin
       insertText(`VALOR: $${Number(displayValue).toFixed(2)}\n`);
     }
 
-    // 5. Screenshots — normalized to exactly 3.11"×4.01", 2 per page with header.
-    // Page break after every 2nd image enforces 2-2-1 grouping.
+    // 5. Screenshots — normalized to ~6"×8", 1 per page.
+    // Page break after every image if more remain.
     if (order.screenshotUrls && order.screenshotUrls.length > 0) {
       for (let i = 0; i < order.screenshotUrls.length; i++) {
         const url = normalizedUrlMap.get(order.screenshotUrls[i]) || order.screenshotUrls[i];
         insertImage(url);
-        // After every 2nd image, page break if more images remain
-        if (i % 2 === 1 && i < order.screenshotUrls.length - 1) {
+        insertText('\n');
+        // Page break after every image if more remain
+        if (i < order.screenshotUrls.length - 1) {
           insertPageBreak();
-          insertText('\n');
-        } else {
-          insertText('\n');
         }
       }
     }
