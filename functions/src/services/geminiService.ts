@@ -85,10 +85,10 @@ export const analyzeOrderScreenshot = async (
       },
     ],
     generationConfig: {
-      temperature: 0.1, // Very low = more factual, deterministic
-      topP: 0.95,
-      topK: 40,
+      temperature: 0,
+      topP: 1.0,
       candidateCount: 1,
+      responseMimeType: 'application/json',
     },
   });
 
@@ -275,10 +275,10 @@ Return ONLY valid JSON.`;
             },
           ],
           generationConfig: {
-            temperature: 0.1,
-            topP: 0.95,
-            topK: 40,
+            temperature: 0,
+            topP: 1.0,
             candidateCount: 1,
+            responseMimeType: 'application/json',
           },
         });
 

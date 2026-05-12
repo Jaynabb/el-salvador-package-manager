@@ -61,10 +61,10 @@ export const analyzeOrderScreenshot = async (base64Image: string): Promise<Extra
       },
     ],
     generationConfig: {
-      temperature: 0.1, // Very low = more factual, deterministic
-      topP: 0.95,
-      topK: 40,
+      temperature: 0,
+      topP: 1.0,
       candidateCount: 1,
+      responseMimeType: 'application/json',
     },
   });
 
@@ -833,10 +833,10 @@ Return ONLY valid JSON, no markdown, no extra text.`;
             },
           ],
           generationConfig: {
-            temperature: 0.1,
-            topP: 0.95,
-            topK: 40,
+            temperature: 0,
+            topP: 1.0,
             candidateCount: 1,
+            responseMimeType: 'application/json',
           },
         });
 
@@ -994,7 +994,12 @@ export const extractItemsFromDocText = async (docText: string, customerName?: st
 }> => {
   const model = genAI.getGenerativeModel({
     model: 'gemini-2.5-flash',
-    generationConfig: { temperature: 0.1, topP: 0.95, topK: 40, candidateCount: 1 },
+    generationConfig: {
+      temperature: 0,
+      topP: 1.0,
+      candidateCount: 1,
+      responseMimeType: 'application/json',
+    },
   });
 
   const prompt = `You are extracting item data from a Word document for El Salvador customs declarations.
