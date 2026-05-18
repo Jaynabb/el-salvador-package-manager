@@ -552,7 +552,6 @@ const buildPageData = (
   const gestorLabel = profile?.gestorNumber
     ? `Gestor ${profile.gestorNumber}`
     : 'Gestor';
-  const nombreLabel = profile?.displayName?.trim() || 'Nombre';
   const rows: Record<string, unknown>[] = [];
   const merges: Record<string, unknown>[] = [];
   const isLastPage = pageIndex === totalPages - 1;
@@ -746,14 +745,18 @@ const buildPageData = (
   rows.push(emptyRow());
   currentRow++;
 
+  // Signature lines. Print the operator's name ON the Nombre line (above the "Nombre"
+  // label) instead of replacing the label, so the layout stays symmetric with the
+  // still-blank Firma side. If no name is set, fall back to a blank underline.
+  const displayName = profile?.displayName?.trim() || '';
   rows.push(makeRow({
-    2: makeCell({ value: '____________________' }),
+    2: makeCell({ value: displayName || '____________________' }),
     8: makeCell({ value: '____________________' }),
   }));
   currentRow++;
 
   rows.push(makeRow({
-    2: makeCell({ value: nombreLabel }),
+    2: makeCell({ value: 'Nombre' }),
     8: makeCell({ value: 'Firma' }),
   }));
   currentRow++;
