@@ -32,12 +32,34 @@ export default function Settings() {
   const [profileSaving, setProfileSaving] = useState(false);
   const [profileMessage, setProfileMessage] = useState<{type: 'success' | 'error', text: string} | null>(null);
 
-  // Seed profile form whenever the auth context user changes
+  // Seed profile form from Firestore directly on mount + when currentUser changes.
+  // Reading from the auth context alone is stale — currentUser only refreshes on
+  // sign-in, so a save during this session wouldn't show up here. Pulling fresh from
+  // /users/{uid} ensures the form always reflects what's actually persisted.
   useEffect(() => {
-    if (currentUser) {
-      setProfileDisplayName(currentUser.displayName || '');
-      setProfileGestorNumber(currentUser.gestorNumber || '');
-    }
+    if (!currentUser?.uid || !db) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const userSnap = await getDoc(doc(db!, 'users', currentUser.uid));
+        if (cancelled) return;
+        if (userSnap.exists()) {
+          const data = userSnap.data();
+          setProfileDisplayName(data.displayName ?? currentUser.displayName ?? '');
+          setProfileGestorNumber(data.gestorNumber ?? '');
+        } else {
+          setProfileDisplayName(currentUser.displayName || '');
+          setProfileGestorNumber(currentUser.gestorNumber || '');
+        }
+      } catch (err) {
+        console.warn('Could not load profile from Firestore; falling back to auth context:', err);
+        if (!cancelled) {
+          setProfileDisplayName(currentUser.displayName || '');
+          setProfileGestorNumber(currentUser.gestorNumber || '');
+        }
+      }
+    })();
+    return () => { cancelled = true; };
   }, [currentUser]);
 
   const handleProfileSave = async () => {
