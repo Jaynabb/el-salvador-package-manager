@@ -738,19 +738,26 @@ const buildPageData = (
     currentRow++;
   }
 
-  // ── Signature block (2 blank + underscores + labels) ─────────────────
+  // ── Signature block (blank + name + underscores + labels) ────────────
+  //
+  // Layout (both sides symmetric, Firma side blank for handwritten signature):
+  //   row N:    (blank)            (blank)
+  //   row N+1:  Jamari McNabb      (blank)        ← printed name above Nombre line
+  //   row N+2:  __________         __________     ← signature lines
+  //   row N+3:  Nombre             Firma          ← labels
 
   rows.push(emptyRow());
   currentRow++;
-  rows.push(emptyRow());
-  currentRow++;
 
-  // Signature lines. Print the operator's name ON the Nombre line (above the "Nombre"
-  // label) instead of replacing the label, so the layout stays symmetric with the
-  // still-blank Firma side. If no name is set, fall back to a blank underline.
   const displayName = profile?.displayName?.trim() || '';
   rows.push(makeRow({
-    2: makeCell({ value: displayName || '____________________' }),
+    2: makeCell({ value: displayName }),
+    8: makeCell({ value: '' }),
+  }));
+  currentRow++;
+
+  rows.push(makeRow({
+    2: makeCell({ value: '____________________' }),
     8: makeCell({ value: '____________________' }),
   }));
   currentRow++;
