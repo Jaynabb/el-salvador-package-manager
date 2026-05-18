@@ -1,16 +1,19 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../contexts/AuthContext';
-import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, query, orderBy } from 'firebase/firestore';
+import { collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, query, orderBy } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { exportOrdersToGoogleDocs, startNewGoogleDoc } from '../services/orderExportService';
 import { exportOrdersToGoogleSheets, startNewGoogleSheet } from '../services/orderSheetsExportService';
 import { exportOrdersToGoogleSheet } from '../services/orderExcelExportService';
-import { extractItemsFromDocText, analyzeOrderScreenshot } from '../services/geminiService';
+import { extractItemsFromDocText, withRetry } from '../services/geminiService';
 import mammoth from 'mammoth';
 import JSZip from 'jszip';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { storage } from '../services/firebase';
+import { storage, functions } from '../services/firebase';
+import { httpsCallable } from 'firebase/functions';
+import type { ExtractedOrderData } from '../types';
 import type { PackageItem } from '../types';
+import { useToasts, ToastStack } from './Toast';
 
 export interface OrderRow {
   id: string;
@@ -36,10 +39,13 @@ export interface OrderRow {
 
 export default function OrderManagement() {
   const { currentUser } = useAuth();
+  const toast = useToasts();
   const [orders, setOrders] = useState<OrderRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportingSheets, setExportingSheets] = useState(false);
+  const [exportPhase, setExportPhase] = useState<string>('');
   const [selectedRows, setSelectedRows] = useState<Set<string>>(new Set());
   const [showMachoteModal, setShowMachoteModal] = useState(false);
   const [machoteAction, setMachoteAction] = useState<'append' | 'fresh'>('append');
@@ -54,6 +60,7 @@ export default function OrderManagement() {
   const [currentImageIndex, setCurrentImageIndex] = useState(0);
   const [importingDoc, setImportingDoc] = useState(false);
   const [importProgress, setImportProgress] = useState('');
+  const [extractionFailures, setExtractionFailures] = useState<Array<{ customer: string; screenshotIndex: number; reason: string }>>([]);
   const wordDocInputRef = React.useRef<HTMLInputElement>(null);
 
   // Filter state
@@ -92,20 +99,17 @@ export default function OrderManagement() {
     if (!currentUser?.organizationId) {
       console.warn('No organization ID available');
       setLoading(false);
+      setLoadError('No organization linked to this account. Sign out and back in, or contact support.');
       return;
     }
 
     try {
       setLoading(true);
-      console.log('🔍 OrderManagement - Loading orders...');
-      console.log('Organization ID:', currentUser.organizationId);
-      console.log('Collection path:', `organizations/${currentUser.organizationId}/orders`);
+      setLoadError(null);
 
       const ordersRef = collection(db, 'organizations', currentUser.organizationId, 'orders');
       const q = query(ordersRef, orderBy('createdAt', 'asc'));
       const snapshot = await getDocs(q);
-
-      console.log('✅ Orders loaded:', snapshot.size);
 
       const loadedOrders: OrderRow[] = snapshot.docs.map(doc => ({
         id: doc.id,
@@ -113,10 +117,12 @@ export default function OrderManagement() {
         createdAt: doc.data().createdAt?.toDate() || new Date(),
       } as OrderRow));
 
-      console.log('📦 Orders:', loadedOrders);
       setOrders(loadedOrders);
     } catch (error) {
       console.error('Error loading orders:', error);
+      const msg = error instanceof Error ? error.message : 'Unknown error loading orders.';
+      setLoadError(msg);
+      toast.error('Could not load orders', msg);
     } finally {
       setLoading(false);
     }
@@ -154,7 +160,7 @@ export default function OrderManagement() {
       setEditValue('');
     } catch (error) {
       console.error('Error saving cell:', error);
-      alert('Failed to save changes');
+      toast.error('Failed to save changes', error instanceof Error ? error.message : undefined);
     }
   };
 
@@ -266,23 +272,24 @@ export default function OrderManagement() {
         await deleteDoc(orderRef);
       }
 
+      const deletedCount = selectedRows.size;
       setOrders(prev => prev.filter(order => !selectedRows.has(order.id)));
       setSelectedRows(new Set());
-      alert(`✅ Deleted ${selectedRows.size} row${selectedRows.size !== 1 ? 's' : ''}`);
+      toast.success(`Deleted ${deletedCount} row${deletedCount !== 1 ? 's' : ''}`);
     } catch (error) {
       console.error('Error deleting rows:', error);
-      alert('Failed to delete rows');
+      toast.error('Failed to delete rows', error instanceof Error ? error.message : undefined);
     }
   };
 
   const handleMachoteExport = async (createNew: boolean) => {
     if (selectedRows.size === 0) {
-      alert('Please select rows to export');
+      toast.warning('Select at least one row to export');
       return;
     }
 
     if (!currentUser?.organizationId) {
-      alert('❌ Organization not configured');
+      toast.error('Organization not configured');
       return;
     }
 
@@ -294,12 +301,11 @@ export default function OrderManagement() {
     try {
       // If user chose to create new, clear the active doc ID first
       if (createNew) {
+        setExportPhase('Preparing new Machote…');
         await startNewGoogleDoc(currentUser.organizationId);
       }
 
-      // Show loading message
-      const exportingMessage = `Exporting ${selectedRows.size} order${selectedRows.size !== 1 ? 's' : ''} to Google Docs...`;
-      console.log(exportingMessage);
+      setExportPhase(`Generating Machote for ${selectedRows.size} order${selectedRows.size !== 1 ? 's' : ''}…`);
 
       // Export to Google Docs (pass user ID for tracking)
       const result = await exportOrdersToGoogleDocs(
@@ -310,28 +316,33 @@ export default function OrderManagement() {
 
       if (result.success && result.docUrl) {
         // Success - open the doc
+        setExportPhase('Opening Google Doc…');
         window.open(result.docUrl, '_blank');
         const action = createNew ? 'Created new Machote' : (result.isNew ? 'Created new Machote' : 'Added to existing Machote');
-        alert(`✅ Successfully exported ${selectedRows.size} order${selectedRows.size !== 1 ? 's' : ''}!\n\n${action}\n\nOpening Google Doc...`);
+        const count = selectedRows.size;
+        toast.success(
+          `Exported ${count} order${count !== 1 ? 's' : ''}`,
+          `${action} — opening Google Doc`
+        );
 
         // Clear selections after successful export
         setSelectedRows(new Set());
       } else {
-        // Error
-        alert(`❌ Export failed: ${result.error || 'Unknown error'}`);
+        toast.error('Export failed', result.error || 'Unknown error');
       }
     } catch (error) {
       console.error('Export error:', error);
-      alert(`❌ Export failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      toast.error('Export failed', error instanceof Error ? error.message : 'Unknown error');
     } finally {
       setExporting(false);
+      setExportPhase('');
     }
   };
 
 
   const handleExportToSheets = async () => {
     if (selectedRows.size === 0) {
-      alert('Please select orders to export');
+      toast.warning('Select at least one order to export');
       return;
     }
 
@@ -349,11 +360,35 @@ export default function OrderManagement() {
     }
 
     setExportingSheets(true);
+    setExportPhase(`Building customs sheet for ${selectedOrders.length} order${selectedOrders.length !== 1 ? 's' : ''}…`);
     try {
+      // Re-read the user profile fresh from Firestore — currentUser is loaded once at
+      // login and won't reflect a Settings save until the next session. Reading here
+      // guarantees the Gestor # and display name reflect what's saved right now.
+      let freshGestorNumber: string | undefined = currentUser?.gestorNumber;
+      let freshDisplayName: string | undefined = currentUser?.displayName;
+      if (currentUser?.uid) {
+        try {
+          const userSnap = await getDoc(doc(db, 'users', currentUser.uid));
+          if (userSnap.exists()) {
+            const data = userSnap.data();
+            freshGestorNumber = data.gestorNumber ?? freshGestorNumber;
+            freshDisplayName = data.displayName ?? freshDisplayName;
+          }
+        } catch (err) {
+          console.warn('Could not refresh user profile from Firestore:', err);
+        }
+      }
+
       const result = await exportOrdersToGoogleSheet(
         selectedOrders,
         currentUser?.organizationId || '',
         currentUser?.uid,
+        {
+          gestorNumber: freshGestorNumber,
+          displayName: freshDisplayName,
+        },
+        currentUser?.email,
       );
 
       if (result.success && result.sheetUrl) {
@@ -366,22 +401,77 @@ export default function OrderManagement() {
         setSelectedRows(new Set());
 
         // Open the Google Sheet in a new tab (same pattern as Machote)
+        setExportPhase('Opening Google Sheet…');
         window.open(result.sheetUrl, '_blank');
 
-        alert(
-          `✅ Successfully exported ${selectedOrders.length} order(s) with ${totalItems} line items!\n\n` +
-          `Google Sheet opened in a new tab.\n` +
-          `Ready for customs submission.`
+        toast.success(
+          `Exported ${selectedOrders.length} order${selectedOrders.length !== 1 ? 's' : ''} (${totalItems} line items)`,
+          'Google Sheet opened in a new tab — ready for customs submission.'
         );
       } else {
-        alert(`❌ Export failed: ${result.error || 'Unknown error'}`);
+        toast.error('Export failed', result.error || 'Unknown error');
       }
     } catch (error) {
       console.error('Customs export error:', error);
-      alert(`❌ Export failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      toast.error('Export failed', error instanceof Error ? error.message : 'Unknown error');
     } finally {
       setExportingSheets(false);
+      setExportPhase('');
     }
+  };
+
+  /**
+   * Run screenshot extraction on the server.
+   *
+   * Why: prior to this, every user's browser called Gemini directly. Users on
+   * slower networks (Julio in El Salvador) saw transient failures, rate limits,
+   * and dropped items that headquarters users never hit. Moving extraction to a
+   * Cloud Function puts every user on the same runtime — same region, same retry
+   * policy, same quota pool — so the SaaS behaves identically regardless of
+   * location.
+   *
+   * Returns one entry per input image, in the same order.
+   */
+  const extractScreenshotsViaServer = async (
+    images: Array<{ base64: string; contentType: string }>,
+    label: (idx: number) => string,
+    onProgress?: (completed: number, total: number) => void
+  ): Promise<Array<{ ok: true; data: ExtractedOrderData } | { ok: false; error: string }>> => {
+    if (!functions) throw new Error('Cloud Functions not initialized — check Firebase config.');
+    const extract = httpsCallable<
+      { images: Array<{ base64: string; mimeType: string; clientIdx: number }>; lenient: boolean },
+      { results: Array<{ clientIdx: number; ok: true; data: ExtractedOrderData } | { clientIdx: number; ok: false; error: string }> }
+    >(functions, 'extractScreenshotBatch');
+
+    const CHUNK_SIZE = 10;
+    const out: Array<{ ok: true; data: ExtractedOrderData } | { ok: false; error: string }> = new Array(images.length);
+    let completed = 0;
+
+    for (let i = 0; i < images.length; i += CHUNK_SIZE) {
+      const slice = images.slice(i, i + CHUNK_SIZE);
+      const payload = slice.map((img, j) => ({
+        base64: img.base64,
+        mimeType: img.contentType,
+        clientIdx: i + j,
+      }));
+
+      // Wrap the callable invocation itself in retry — if the function gateway
+      // returns 429/5xx (rare), retry the whole batch once.
+      const response = await withRetry(
+        () => extract({ images: payload, lenient: true }),
+        { label: `extractScreenshotBatch [${i}-${i + slice.length - 1}]`, maxAttempts: 2 }
+      );
+
+      for (const r of response.data.results) {
+        if (r.ok) out[r.clientIdx] = { ok: true, data: r.data };
+        else out[r.clientIdx] = { ok: false, error: r.error };
+      }
+
+      completed += slice.length;
+      onProgress?.(completed, images.length);
+    }
+
+    return out;
   };
 
   const handleWordDocUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -393,6 +483,8 @@ export default function OrderManagement() {
 
     setImportingDoc(true);
     setImportProgress('Reading document...');
+    setExtractionFailures([]);
+    const failures: Array<{ customer: string; screenshotIndex: number; reason: string }> = [];
     try {
       console.log(`📄 handleWordDocUpload starting...`);
 
@@ -472,15 +564,37 @@ export default function OrderManagement() {
 
       console.log(`📄 Loaded ${allImages.length} images as base64`);
 
-      // Step 3: Detect Machote format
-      // New format: "1 Julio Smith" (number + name on one line)
-      // Old format: "Paquete #1" on a separate line
-      const hasPaquete = /Paquete\s*#?\s*\d+/i.test(docText);
-      const hasNumberedNames = /^\s*\d{1,3}\s+[A-Za-zÀ-ÿ]+\s+[A-Za-zÀ-ÿ]/m.test(docText);
-      const isMachote = (hasPaquete || hasNumberedNames) && allImages.length > 0;
+      // Step 3: Permissive machote detection. Instead of gating on specific layouts
+      // (which breaks every time a new customer brings a new format), we just look
+      // for distinct (number, name) pairs anywhere in the doc, in any order:
+      //   "Paquete #1 CESAR"          ✓
+      //   "CESAR CUBIAS #1"           ✓ (Julio's carga)
+      //   "1 Julio Smith"             ✓
+      //   "#1 CESAR"                  ✓
+      // If we find 2+ distinct package numbers near uppercase-leading names, it's
+      // a multi-customer machote. Otherwise fall back to single-customer prompt.
+      const NAME_FRAG = /[A-ZÀ-Ý][A-ZÀ-Ýa-zà-ÿ.'-]+(?:\s+[A-ZÀ-Ý][A-ZÀ-Ýa-zà-ÿ.'-]+){0,3}/.source;
+      // Package identifier token — accepts whatever Julio (or any customer) puts next to
+      // a name in the Machote: pure digits ("5", "8240"), warehouse codes ("W12345",
+      // "WH-001"), mixed alphanumeric ("ABC123"), pure letters ("ABC"). 1-16 chars,
+      // uppercase alphanumeric + internal dashes. Must start with letter or digit. Same
+      // shape as PKG_TOKEN in tryMatch() below — keep in sync.
+      const PKG_TOKEN_FRAG = String.raw`[A-Z0-9][A-Z0-9-]{0,15}`;
+      const findDistinctPackageNumbers = (text: string): Set<string> => {
+        const found = new Set<string>();
+        // name-then-number: "CESAR CUBIAS #1" or "CESAR CUBIAS W12345"
+        const reNameNum = new RegExp(`(${NAME_FRAG})\\s+(?:Paquete\\s+)?#?\\s*(${PKG_TOKEN_FRAG})\\b`, 'g');
+        for (const m of text.matchAll(reNameNum)) found.add(m[2]);
+        // number-then-name: "Paquete #1 CESAR" or "W12345 CESAR CUBIAS"
+        const reNumName = new RegExp(`(?:Paquete\\s+)?#?\\s*(${PKG_TOKEN_FRAG})\\b\\s+(${NAME_FRAG})`, 'g');
+        for (const m of text.matchAll(reNumName)) found.add(m[1]);
+        return found;
+      };
+      const distinctPkgs = findDistinctPackageNumbers(docText);
+      const isMachote = distinctPkgs.size >= 2 && allImages.length > 0;
       const hasImages = allImages.length > 0;
 
-      console.log(`📄 isMachote=${isMachote}, hasImages=${hasImages} (hasPaquete=${hasPaquete}, hasNumberedNames=${hasNumberedNames}, images=${allImages.length})`);
+      console.log(`📄 isMachote=${isMachote}, hasImages=${hasImages} (distinctPackageNumbers=${distinctPkgs.size}, images=${allImages.length})`);
 
       const ordersRef = collection(db, 'organizations', currentUser.organizationId, 'orders');
 
@@ -523,10 +637,6 @@ export default function OrderManagement() {
 
         events.sort((a, b) => a.pos - b.pos);
 
-        // Split events into customer blocks
-        // Supports two formats:
-        //   New: "1 Julio Smith" (number + name on one line, centered above screenshots)
-        //   Old: separate lines for name, "Paquete #N", carrier, VALOR
         interface MachoteBlock {
           name: string;
           packageNumber: string;
@@ -540,63 +650,76 @@ export default function OrderManagement() {
         let currentBlock: MachoteBlock | null = null;
         let textBuffer = '';
 
-        // Detect which format we're dealing with
-        const useNewFormat = hasNumberedNames && !hasPaquete;
+        // Unified parser: try each pattern in order of specificity. First match wins.
+        // Strongest signal first (explicit "Paquete" anchor) → weakest (bare name + number).
+        // Same customer can appear with different package numbers (e.g. MARIO MARROQUIN
+        // #5, #6, #7) — dedupe on packageNumber, not name.
+        //
+        // The captured package identifier (`PKG_TOKEN`) is whatever appears next to the
+        // customer name in the Machote. Per Jay's 5/17 direction: not limited to digits
+        // or W-codes — any series of uppercase letters/digits (with internal dashes) up
+        // to 16 chars qualifies. Examples: "1", "8240", "W12345", "WH-001", "ABC123",
+        // "ABC". Whatever lands here flows into the Desarrollo "No de PK" cell — that's
+        // the operator's "control interno" identifier. Same shape as PKG_TOKEN_FRAG used
+        // in findDistinctPackageNumbers above — keep them in sync.
+        const PKG_TOKEN = String.raw`([A-Z0-9][A-Z0-9-]{0,15})`;
+        const tryMatch = (buf: string): { name: string; number: string } | null => {
+          // 1. Paquete format: "...Paquete #N" with name as preceding capitalized text
+          const pMatch = buf.match(new RegExp(String.raw`Paquete\s*#?\s*${PKG_TOKEN}\b`, 'i'));
+          if (pMatch) {
+            const pIdx = buf.lastIndexOf('Paquete', pMatch.index! + pMatch[0].length);
+            const before = buf.substring(0, pIdx).trim();
+            // Strip out tokens that aren't names (carriers, valor, tracking) so name lookback works
+            const segments = before.split(/(?:VALOR|VAR|USPS|UPS|FedEx|DHL|SpeedX|OnTrac|LaserShip|Amazon\s*Logistics?|#\d{3,}|\$[\d,.]+|:)/i)
+              .filter(s => s.trim().length > 1);
+            let name = 'Unknown';
+            if (segments.length > 0) {
+              const cand = segments[segments.length - 1].trim().replace(/\s+/g, ' ');
+              if (cand.length > 1 && cand.length < 60) name = cand;
+            }
+            return { name, number: pMatch[1] };
+          }
+          // 2. Name then "#N": "CESAR CUBIAS #1" or "CESAR CUBIAS #W12345"
+          const nhMatch = buf.match(new RegExp(String.raw`([A-ZÀ-Ý][A-ZÀ-Ýa-zà-ÿ.'-]+(?:\s+[A-ZÀ-Ý][A-ZÀ-Ýa-zà-ÿ.'-]+){0,3})\s+#\s*${PKG_TOKEN}\b`));
+          if (nhMatch) return { name: nhMatch[1].trim().replace(/\s+/g, ' '), number: nhMatch[2] };
+          // 3. "#N Name": "#1 CESAR" or "#W12345 CESAR"
+          const hnMatch = buf.match(new RegExp(String.raw`#\s*${PKG_TOKEN}\b\s+([A-ZÀ-Ý][A-ZÀ-Ýa-zà-ÿ.'-]+(?:\s+[A-ZÀ-Ý][A-ZÀ-Ýa-zà-ÿ.'-]+){0,3})`));
+          if (hnMatch) return { name: hnMatch[2].trim().replace(/\s+/g, ' '), number: hnMatch[1] };
+          // 4. Bare number/code then name: "1 CESAR CUBIAS" or "W12345 CESAR CUBIAS"
+          const nNameMatch = buf.match(new RegExp(String.raw`(?:^|\s)${PKG_TOKEN}\s+([A-ZÀ-Ý][A-ZÀ-Ýa-zà-ÿ.'-]+(?:\s+[A-ZÀ-Ý][A-ZÀ-Ýa-zà-ÿ.'-]+){0,3})`));
+          if (nNameMatch) return { name: nNameMatch[2].trim().replace(/\s+/g, ' '), number: nNameMatch[1] };
+          // 5. Name then bare number/code: "CESAR CUBIAS 1" or "CESAR CUBIAS W12345" (no `#` marker)
+          const nameNMatch = buf.match(new RegExp(String.raw`([A-ZÀ-Ý][A-ZÀ-Ýa-zà-ÿ.'-]+(?:\s+[A-ZÀ-Ý][A-ZÀ-Ýa-zà-ÿ.'-]+){0,3})\s+${PKG_TOKEN}\b`));
+          if (nameNMatch) return { name: nameNMatch[1].trim().replace(/\s+/g, ' '), number: nameNMatch[2] };
+          return null;
+        };
 
         for (const ev of events) {
           if (ev.type === 'text') {
             textBuffer += ev.value + ' ';
-
-            if (useNewFormat) {
-              // New format: "1 Julio Smith" — 1-3 digit number followed by first + last name
-              const nMatch = textBuffer.match(/(\d{1,3})\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.'-]*\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s.'-]*)/);
-              if (nMatch && (!currentBlock || currentBlock.packageNumber !== nMatch[1])) {
-                currentBlock = {
-                  name: nMatch[2].trim(),
-                  packageNumber: nMatch[1],
-                  carrier: '',
-                  trackingLast4: '',
-                  value: 0,
-                  imageIndices: [],
-                };
-                blocks.push(currentBlock);
-                textBuffer = '';
-              }
-            } else {
-              // Old format: "Paquete #N" with name on a previous line
-              const pMatch = textBuffer.match(/Paquete\s*#(\d+)/i);
-              if (pMatch && (!currentBlock || currentBlock.packageNumber !== pMatch[1])) {
-                const beforeText = textBuffer;
-                let name = 'Unknown';
-                const pIdx = beforeText.lastIndexOf('Paquete');
-                const textBefore = beforeText.substring(0, pIdx).trim();
-                const segments = textBefore.split(/(?:VALOR|VAR|USPS|UPS|FedEx|DHL|SpeedX|#\d{4}|\$[\d,.]+|:)/i).filter(s => s.trim().length > 1);
-                if (segments.length > 0) {
-                  const candidate = segments[segments.length - 1].trim();
-                  if (candidate.length > 1 && candidate.length < 60) {
-                    name = candidate;
-                  }
-                }
-
-                currentBlock = {
-                  name,
-                  packageNumber: pMatch[1],
-                  carrier: '',
-                  trackingLast4: '',
-                  value: 0,
-                  imageIndices: [],
-                };
-                blocks.push(currentBlock);
-                textBuffer = '';
-              }
+            const m = tryMatch(textBuffer);
+            if (m && (!currentBlock || currentBlock.packageNumber !== m.number)) {
+              currentBlock = {
+                name: m.name,
+                packageNumber: m.number,
+                carrier: '',
+                trackingLast4: '',
+                value: 0,
+                imageIndices: [],
+              };
+              blocks.push(currentBlock);
+              textBuffer = '';
             }
           } else if (ev.type === 'image' && currentBlock) {
             currentBlock.imageIndices.push(parseInt(ev.value));
           }
         }
 
-        // For old format, extract carrier/tracking/valor from surrounding text
-        if (!useNewFormat) {
+        // For docs that use the explicit Paquete format, enrich blocks with carrier,
+        // tracking-last-4, and VALOR pulled from text around each "Paquete #N" anchor.
+        // Other formats don't carry this metadata inline; fields stay empty and can be
+        // filled by Gemini extraction or manual edit.
+        if (/Paquete\s*#?\s*\d+/i.test(docText)) {
           const rawLines = docText.replace(/\s+/g, ' ');
           for (const block of blocks) {
             const paquetePattern = new RegExp(`Paquete\\s*#${block.packageNumber}\\b([\\s\\S]{0,200})`, 'i');
@@ -625,48 +748,61 @@ export default function OrderManagement() {
         }
 
         if (blocks.length === 0) {
-          alert('No customer blocks found in the Machote document.');
+          toast.warning('No customer blocks found in the Machote document');
           return;
         }
 
-        // Process screenshots through Gemini vision
-        const CONCURRENCY = 3;
+        // Send all screenshots to the server-side extraction function. Server runs
+        // them with its own retry + concurrency policy, so every user gets the same
+        // execution path regardless of network/location/device. The client only
+        // uploads bytes and waits for the result.
         const totalScreenshots = blocks.reduce((sum, b) => sum + b.imageIndices.length, 0);
-        let processedCount = 0;
+        console.log(`📸 Sending ${totalScreenshots} screenshots across ${blocks.length} customers to server extractor...`);
+        setImportProgress(`Found ${blocks.length} customers, ${totalScreenshots} screenshots. Analyzing on server...`);
 
-        console.log(`📸 Processing ${totalScreenshots} screenshots across ${blocks.length} customers...`);
-        setImportProgress(`Found ${blocks.length} customers, ${totalScreenshots} screenshots. Analyzing...`);
+        // Build a flat list of {idx, image} so we can route results back to the right block
+        const flatImages: Array<{ base64: string; contentType: string }> = [];
+        const idxToBlock = new Map<number, MachoteBlock>();
+        for (const block of blocks) {
+          for (const imgIdx of block.imageIndices) {
+            const img = allImages[imgIdx];
+            if (!img) {
+              failures.push({ customer: block.name, screenshotIndex: imgIdx, reason: 'image data missing' });
+              continue;
+            }
+            idxToBlock.set(flatImages.length, block);
+            flatImages.push(img);
+          }
+        }
+
+        const serverResults = await extractScreenshotsViaServer(
+          flatImages,
+          (idx) => `flat #${idx}`,
+          (done, total) => setImportProgress(`Analyzing screenshot ${done}/${total} on server...`)
+        );
+
+        // Route results back to blocks
+        const itemsByBlock = new Map<MachoteBlock, PackageItem[]>();
+        for (let k = 0; k < serverResults.length; k++) {
+          const r = serverResults[k];
+          const block = idxToBlock.get(k);
+          if (!block) continue;
+          if (r.ok) {
+            if (r.data.items && r.data.items.length > 0) {
+              if (!itemsByBlock.has(block)) itemsByBlock.set(block, []);
+              itemsByBlock.get(block)!.push(...r.data.items);
+            }
+          } else {
+            console.warn(`⚠️ Screenshot #${k} failed for ${block.name}:`, r.error);
+            failures.push({ customer: block.name, screenshotIndex: k, reason: r.error.slice(0, 200) });
+          }
+        }
 
         let createdCount = 0;
         let totalItems = 0;
 
         for (const block of blocks) {
-          const allItemsForBlock: PackageItem[] = [];
-
-          // Process images in batches
-          for (let j = 0; j < block.imageIndices.length; j += CONCURRENCY) {
-            const batch = block.imageIndices.slice(j, j + CONCURRENCY);
-            const results = await Promise.allSettled(
-              batch.map(async (imgIdx) => {
-                const img = allImages[imgIdx];
-                if (!img) return null;
-                return analyzeOrderScreenshot(img.base64, img.contentType, true);
-              })
-            );
-
-            for (const result of results) {
-              processedCount++;
-              console.log(`📸 Screenshot ${processedCount}/${totalScreenshots} done`);
-              setImportProgress(`Analyzing screenshot ${processedCount}/${totalScreenshots}...`);
-              if (result.status === 'fulfilled' && result.value) {
-                if (result.value.items && result.value.items.length > 0) {
-                  allItemsForBlock.push(...result.value.items);
-                }
-              } else if (result.status === 'rejected') {
-                console.warn(`⚠️ Screenshot failed:`, (result.reason as any)?.message || result.reason);
-              }
-            }
-          }
+          const allItemsForBlock = itemsByBlock.get(block) || [];
 
           // Upload screenshots to Firebase Storage
           const screenshotUrls: string[] = [];
@@ -725,32 +861,38 @@ export default function OrderManagement() {
 
         await loadOrders();
 
-        alert(
-          `✅ Machote imported!\n\n` +
-          `Created ${createdCount} order(s) with ${totalItems} items from ${totalScreenshots} screenshots.\n\n` +
-          `Review the orders below, then export to Desarrollo.`
+        const failureLine = failures.length > 0
+          ? `\n\n${failures.length} of ${totalScreenshots} screenshots could not be read (see banner below) — items from those screenshots are missing from totals.`
+          : '';
+        toast.success(
+          `Machote imported — ${createdCount} order${createdCount !== 1 ? 's' : ''}, ${totalItems} items`,
+          `From ${totalScreenshots} screenshots. Review the orders below, then export to Desarrollo.${failureLine}`
         );
       } else if (hasImages) {
-        // --- Doc with images but no Paquete # pattern: ask for customer name, process all images as one order ---
-        const customerName = prompt('Customer name for this document:') || 'Unknown';
-        if (customerName === 'Unknown' && !confirm('No customer name provided. Continue with "Unknown"?')) return;
+        // --- Doc with images but no Paquete # pattern: import as a single "Unknown" order,
+        // user can edit the consignee in the table after import. No blocking prompt. ---
+        const customerName = 'Unknown';
+        toast.info(
+          'Couldn’t auto-detect a customer in the doc',
+          'Importing as "Unknown" — edit the consignee in the table after extraction finishes.'
+        );
 
-        setImportProgress(`Processing ${allImages.length} screenshots...`);
+        setImportProgress(`Processing ${allImages.length} screenshots on server...`);
         const allItemsForOrder: PackageItem[] = [];
-        const CONCURRENCY = 3;
-        let processedCount = 0;
 
-        for (let j = 0; j < allImages.length; j += CONCURRENCY) {
-          const batch = allImages.slice(j, j + CONCURRENCY);
-          const results = await Promise.allSettled(
-            batch.map(async (img) => analyzeOrderScreenshot(img.base64, img.contentType, true))
-          );
-          for (const result of results) {
-            processedCount++;
-            setImportProgress(`Analyzing screenshot ${processedCount}/${allImages.length}...`);
-            if (result.status === 'fulfilled' && result.value?.items?.length > 0) {
-              allItemsForOrder.push(...result.value.items);
-            }
+        const serverResults = await extractScreenshotsViaServer(
+          allImages,
+          (idx) => `flat #${idx} (${customerName})`,
+          (done, total) => setImportProgress(`Analyzing screenshot ${done}/${total} on server...`)
+        );
+
+        for (let k = 0; k < serverResults.length; k++) {
+          const r = serverResults[k];
+          if (r.ok && r.data.items && r.data.items.length > 0) {
+            allItemsForOrder.push(...r.data.items);
+          } else if (!r.ok) {
+            console.warn(`⚠️ Screenshot #${k} failed:`, r.error);
+            failures.push({ customer: customerName, screenshotIndex: k, reason: r.error.slice(0, 200) });
           }
         }
 
@@ -809,20 +951,26 @@ export default function OrderManagement() {
         await addDoc(ordersRef, orderData);
         await loadOrders();
 
-        alert(
-          `✅ Doc imported!\n\n` +
-          `Created 1 order for "${customerName}" with ${allItemsForOrder.length} items from ${allImages.length} screenshots.\n\n` +
-          `Review the order below, then export to Desarrollo.`
+        const failureLineDoc = failures.length > 0
+          ? `\n\n${failures.length} of ${allImages.length} screenshots could not be read (see banner below) — items from those screenshots are missing from the total.`
+          : '';
+        toast.success(
+          `Doc imported — order for ${customerName}`,
+          `${allItemsForOrder.length} items from ${allImages.length} screenshots. Review the order below, then export to Desarrollo.${failureLineDoc}`
         );
       } else {
-        // --- Plain text only (no images): extract text and send to Gemini ---
-        const customerName = prompt('Customer name for this document:') || 'Unknown';
-        if (customerName === 'Unknown' && !confirm('No customer name provided. Continue with "Unknown"?')) return;
+        // --- Plain text only (no images): extract text and send to Gemini.
+        // Default to "Unknown"; user edits in the table. No blocking prompt. ---
+        const customerName = 'Unknown';
+        toast.info(
+          'Couldn’t auto-detect a customer in the doc',
+          'Importing as "Unknown" — edit the consignee in the table after extraction finishes.'
+        );
 
         const extracted = await extractItemsFromDocText(docText, customerName);
 
         if (!extracted.customers || extracted.customers.length === 0) {
-          alert('No items could be extracted from the document.');
+          toast.warning('No items could be extracted from the document');
           return;
         }
 
@@ -869,24 +1017,24 @@ export default function OrderManagement() {
 
         await loadOrders();
 
-        alert(
-          `✅ Word doc imported!\n\n` +
-          `Created ${createdCount} order(s) with ${totalItems} items.\n\n` +
-          `Review the orders below, then export to Desarrollo.`
+        toast.success(
+          `Word doc imported — ${createdCount} order${createdCount !== 1 ? 's' : ''}, ${totalItems} items`,
+          'Review the orders below, then export to Desarrollo.'
         );
       }
     } catch (error) {
       console.error('Word doc import error:', error);
-      alert(`❌ Import failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      toast.error('Import failed', error instanceof Error ? error.message : 'Unknown error');
     } finally {
       setImportingDoc(false);
       setImportProgress('');
+      if (failures.length > 0) setExtractionFailures(failures);
     }
   };
 
   const handleStartNewSheet = async () => {
     if (!currentUser?.organizationId) {
-      alert('❌ Organization not configured');
+      toast.error('Organization not configured');
       return;
     }
 
@@ -902,17 +1050,14 @@ export default function OrderManagement() {
 
     try {
       await startNewGoogleSheet(currentUser.organizationId);
-      alert(
-        '✅ Customs sheet disconnected!\n\n' +
-        'To set up a new customs sheet:\n\n' +
-        '1. Go to: https://docs.google.com/spreadsheets/d/1WTHICIYqU4QiYXnVrgc2RrVxuhIDYmxtdy81d5g2mDA/edit\n' +
-        '2. Click File → Make a copy\n' +
-        '3. Copy the sheet ID from the URL\n' +
-        '4. Go to Settings and paste it as "Customs Sheet ID"'
+      toast.info(
+        'Customs sheet disconnected',
+        'Next steps:\n1. Open the customs template, then File → Make a copy\n2. Copy the new sheet ID from the URL\n3. Paste it into Settings → Customs Sheet ID',
+        0
       );
     } catch (error) {
       console.error('Error starting new sheet:', error);
-      alert(`❌ Failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      toast.error('Failed to disconnect sheet', error instanceof Error ? error.message : 'Unknown error');
     }
   };
 
@@ -1031,8 +1176,57 @@ export default function OrderManagement() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-white text-lg">Loading orders...</div>
+      <div className="space-y-4">
+        <ToastStack toasts={toast.toasts} dismiss={toast.dismiss} />
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-white">Order Management</h1>
+            <p className="text-slate-400 text-sm">Loading orders…</p>
+          </div>
+        </div>
+        <div className="bg-slate-800 rounded-lg border border-slate-700 overflow-hidden">
+          <div className="border-b border-slate-700 px-4 py-3 bg-slate-700/50">
+            <div className="h-4 w-32 bg-slate-600 rounded animate-pulse"></div>
+          </div>
+          {Array.from({ length: 5 }).map((_, i) => (
+            <div
+              key={i}
+              className="border-b border-slate-700 last:border-b-0 px-4 py-3 flex items-center gap-4"
+            >
+              <div className="w-4 h-4 bg-slate-700 rounded animate-pulse"></div>
+              <div className="w-16 h-16 bg-slate-700 rounded animate-pulse"></div>
+              <div className="flex-1 space-y-2">
+                <div className="h-3 w-1/3 bg-slate-700 rounded animate-pulse"></div>
+                <div className="h-3 w-1/2 bg-slate-700 rounded animate-pulse"></div>
+              </div>
+              <div className="h-3 w-16 bg-slate-700 rounded animate-pulse"></div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div className="space-y-4">
+        <ToastStack toasts={toast.toasts} dismiss={toast.dismiss} />
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-white">Order Management</h1>
+            <p className="text-slate-400 text-sm">Could not load orders</p>
+          </div>
+        </div>
+        <div className="bg-red-900/30 border border-red-700 rounded-lg p-6 max-w-2xl">
+          <h3 className="text-red-100 font-semibold mb-2">We couldn't reach your orders</h3>
+          <p className="text-red-200/90 text-sm mb-4 font-mono break-words">{loadError}</p>
+          <button
+            onClick={loadOrders}
+            className="px-4 py-2 bg-red-700 hover:bg-red-600 text-white text-sm font-medium rounded-lg transition-colors"
+          >
+            Try again
+          </button>
+        </div>
       </div>
     );
   }
@@ -1083,6 +1277,8 @@ export default function OrderManagement() {
 
   return (
     <div className="space-y-4">
+      <ToastStack toasts={toast.toasts} dismiss={toast.dismiss} />
+
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -1090,6 +1286,39 @@ export default function OrderManagement() {
           <p className="text-slate-400 text-sm">{orders.length} order{orders.length !== 1 ? 's' : ''}</p>
         </div>
       </div>
+
+      {/* Extraction failure banner — surfaces silent screenshot failures so totals never differ between runs without the user knowing why */}
+      {extractionFailures.length > 0 && (
+        <div className="bg-amber-900/30 border border-amber-700 rounded-lg p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <h3 className="text-amber-200 font-semibold text-sm mb-1">
+                ⚠️ {extractionFailures.length} screenshot{extractionFailures.length !== 1 ? 's' : ''} could not be read
+              </h3>
+              <p className="text-amber-200/80 text-xs mb-2">
+                Items from these screenshots are missing from the order totals. Re-run the import (or add items manually) to recover them.
+              </p>
+              <ul className="text-amber-100/90 text-xs space-y-1 max-h-32 overflow-y-auto">
+                {extractionFailures.slice(0, 20).map((f, i) => (
+                  <li key={i} className="font-mono">
+                    {f.customer} (img #{f.screenshotIndex}): {f.reason}
+                  </li>
+                ))}
+                {extractionFailures.length > 20 && (
+                  <li className="italic">…and {extractionFailures.length - 20} more (see browser console)</li>
+                )}
+              </ul>
+            </div>
+            <button
+              onClick={() => setExtractionFailures([])}
+              className="text-amber-300 hover:text-amber-100 text-lg leading-none"
+              aria-label="Dismiss"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Toolbar */}
       <div className="bg-slate-800 rounded-lg border border-slate-700 p-3">
@@ -1243,20 +1472,15 @@ export default function OrderManagement() {
 
       {/* Export Progress Banner */}
       {(exporting || exportingSheets) && (
-        <div className="bg-blue-600 border-2 border-blue-400 rounded-lg shadow-lg p-4 animate-pulse">
-          <div className="flex items-center gap-4">
-            <div className="w-6 h-6 border-3 border-white border-t-transparent rounded-full animate-spin"></div>
-            <div className="flex-1">
-              <p className="text-white font-semibold text-lg">
-                {exporting ? 'Exporting to Google Docs...' : 'Exporting to Excel (Customs Format)...'}
-              </p>
-              <p className="text-blue-100 text-sm">Please wait while we format your customs document</p>
-            </div>
-            <div className="flex gap-1">
-              <div className="w-2 h-2 bg-white rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
-              <div className="w-2 h-2 bg-white rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
-              <div className="w-2 h-2 bg-white rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
-            </div>
+        <div className="bg-blue-900/40 border border-blue-700 rounded-lg p-3 flex items-center gap-3">
+          <div className="w-5 h-5 border-2 border-blue-300 border-t-transparent rounded-full animate-spin flex-shrink-0"></div>
+          <div className="flex-1 min-w-0">
+            <p className="text-blue-100 font-medium text-sm">
+              {exporting ? 'Exporting to Machote (Google Docs)' : 'Exporting customs sheet (Google Sheets)'}
+            </p>
+            <p className="text-blue-200/80 text-xs mt-0.5">
+              {exportPhase || 'Working — this can take up to a minute on large batches.'}
+            </p>
           </div>
         </div>
       )}
@@ -1297,8 +1521,44 @@ export default function OrderManagement() {
             <tbody>
               {sortedOrders.length === 0 ? (
                 <tr>
-                  <td colSpan={showExtraColumns ? 13 : 10} className="px-4 py-12 text-center text-slate-400">
-                    No orders yet. Upload screenshots to automatically populate this table.
+                  <td colSpan={showExtraColumns ? 13 : 10} className="px-4 py-16">
+                    {orders.length === 0 ? (
+                      <div className="flex flex-col items-center text-center max-w-md mx-auto">
+                        <div className="w-16 h-16 rounded-full bg-slate-700/60 border border-slate-600 flex items-center justify-center mb-4">
+                          <svg className="w-8 h-8 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                          </svg>
+                        </div>
+                        <h3 className="text-white font-semibold text-base mb-1">No orders yet</h3>
+                        <p className="text-slate-400 text-sm mb-4">
+                          Drop a Word doc of order screenshots into <span className="text-purple-300 font-medium">Import Doc</span>, and we'll extract every customer, package, and line item automatically.
+                        </p>
+                        <button
+                          onClick={() => wordDocInputRef.current?.click()}
+                          className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium rounded-lg transition-colors"
+                        >
+                          Import Doc
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center text-center max-w-md mx-auto">
+                        <h3 className="text-white font-semibold text-base mb-1">No matches</h3>
+                        <p className="text-slate-400 text-sm mb-4">
+                          {orders.length} order{orders.length !== 1 ? 's' : ''} in this org, but none match your current search or filters.
+                        </p>
+                        <button
+                          onClick={() => {
+                            setFilterConsignee('');
+                            setFilterDateFrom('');
+                            setFilterDateTo('');
+                            setSortBy('none');
+                          }}
+                          className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white text-sm font-medium rounded-lg transition-colors"
+                        >
+                          Clear all filters
+                        </button>
+                      </div>
+                    )}
                   </td>
                 </tr>
               ) : (

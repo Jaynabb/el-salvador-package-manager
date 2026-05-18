@@ -26,6 +26,51 @@ export default function Settings() {
   const [whatsappSaving, setWhatsappSaving] = useState(false);
   const [whatsappMessage, setWhatsappMessage] = useState<{type: 'success' | 'error', text: string} | null>(null);
 
+  // Personal profile state (renders into Desarrollo export — gestor # and signing name)
+  const [profileDisplayName, setProfileDisplayName] = useState('');
+  const [profileGestorNumber, setProfileGestorNumber] = useState('');
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileMessage, setProfileMessage] = useState<{type: 'success' | 'error', text: string} | null>(null);
+
+  // Seed profile form whenever the auth context user changes
+  useEffect(() => {
+    if (currentUser) {
+      setProfileDisplayName(currentUser.displayName || '');
+      setProfileGestorNumber(currentUser.gestorNumber || '');
+    }
+  }, [currentUser]);
+
+  const handleProfileSave = async () => {
+    if (!currentUser?.uid) return;
+    const displayName = profileDisplayName.trim();
+    const gestorNumber = profileGestorNumber.trim();
+
+    if (!displayName) {
+      setProfileMessage({ type: 'error', text: 'Please enter a name.' });
+      return;
+    }
+
+    setProfileSaving(true);
+    setProfileMessage(null);
+    try {
+      const userRef = doc(db, 'users', currentUser.uid);
+      await updateDoc(userRef, {
+        displayName,
+        gestorNumber: gestorNumber || null,
+        updatedAt: new Date(),
+      });
+      setProfileMessage({
+        type: 'success',
+        text: 'Profile saved. New exports will use these values once you reload the app.',
+      });
+    } catch (err) {
+      console.error('Failed to save profile:', err);
+      setProfileMessage({ type: 'error', text: 'Failed to save profile. Please try again.' });
+    } finally {
+      setProfileSaving(false);
+    }
+  };
+
   // Load organization data and members
   useEffect(() => {
     const loadOrganization = async () => {
@@ -489,6 +534,54 @@ export default function Settings() {
         <p className="text-slate-400">
           Manage your organization, team, and preferences
         </p>
+      </div>
+
+      {/* Personal Profile — name + gestor # appear on the Desarrollo customs export */}
+      <div className="bg-slate-800 rounded-lg shadow-lg p-6 border border-slate-700">
+        <h2 className="text-xl font-bold text-white mb-2">Your Profile</h2>
+        <p className="text-slate-400 text-sm mb-4">
+          These values render on the Desarrollo customs export — your name on the signing line, your gestor number in the header.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+          <div>
+            <label className="block text-sm text-slate-300 mb-1">Name</label>
+            <input
+              type="text"
+              value={profileDisplayName}
+              onChange={(e) => setProfileDisplayName(e.target.value)}
+              placeholder="Your full name"
+              className="w-full bg-slate-700 text-white rounded-lg px-3 py-2 border border-slate-600 focus:border-blue-500 focus:outline-none"
+            />
+            <p className="text-xs text-slate-500 mt-1">Appears in the &quot;Nombre&quot; cell at the bottom of each Desarrollo sheet.</p>
+          </div>
+          <div>
+            <label className="block text-sm text-slate-300 mb-1">Gestor number</label>
+            <input
+              type="text"
+              value={profileGestorNumber}
+              onChange={(e) => setProfileGestorNumber(e.target.value)}
+              placeholder="e.g. 3145"
+              className="w-full bg-slate-700 text-white rounded-lg px-3 py-2 border border-slate-600 focus:border-blue-500 focus:outline-none"
+            />
+            <p className="text-xs text-slate-500 mt-1">Appears as &quot;Gestor {profileGestorNumber || '____'}&quot; in the top-right of each sheet.</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleProfileSave}
+            disabled={profileSaving}
+            className="bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 text-white font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            {profileSaving ? 'Saving…' : 'Save profile'}
+          </button>
+          {profileMessage && (
+            <span className={`text-sm ${profileMessage.type === 'success' ? 'text-green-400' : 'text-red-400'}`}>
+              {profileMessage.text}
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Organization Profile */}

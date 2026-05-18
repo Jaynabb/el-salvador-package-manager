@@ -54,6 +54,7 @@ interface ExtractedOrderData {
     category: string;
   }>;
   orderTotal?: number | null;
+  notAnOrder?: boolean;
 }
 
 /**
@@ -105,14 +106,42 @@ IMPORTANT LEGAL DISTINCTIONS:
 
 This extraction is for government customs compliance (LEGALLY REQUIRED).
 
-You are analyzing an online shopping order screenshot (Amazon, eBay, AliExpress, Shein, etc).
+You are analyzing an online shopping order screenshot from Shein, Amazon, eBay, AliExpress, Temu,
+or similar e-commerce sites. Screenshots may be from mobile app, mobile web, or desktop web in
+English or Spanish (typically Latin American Spanish).
+
+🔴 🔴 🔴 STEP 0 — CLASSIFY THE SCREENSHOT (but ALWAYS extract visible items) 🔴 🔴 🔴
+
+ALWAYS extract every item with a visible product name + price, regardless of screenshot type.
+NEVER return an empty items list to "reject" a screenshot — the customer uploaded it for a reason
+and missing line items will cause downstream customs totals to be wrong.
+
+After extracting, CLASSIFY whether the screenshot looks like a placed order by checking for ANY of:
+  - Shipping address visible (street + city + state, e.g. "7024 NW 50TH ST", "Miami FLORIDA",
+    "Flylog", "FLYLOG")
+  - Order status: "Entregado", "Enviado", "Salida del almacén", "Delivered", "Shipped",
+    "Out for delivery", "In transit"
+  - Order header: "Detalles del pedido", "Detalles de Pedido", "DETALLES DE PEDIDO",
+    "Order details", "Información de pedido", "Your Order"
+  - Order number explicitly labeled: "Núm. de pedido", "N.º de pedido", "Order #", "Order number"
+  - Carrier/transportista panel: "Transportista", "GOFO", "YunExpress", "USPS"
+
+If NONE of those signals are present (e.g. screenshot is a cart preview, product detail page,
+search result, wishlist, or shopping ad), set "notAnOrder": true in your response — but STILL
+extract every item + price visible. Downstream review will confirm intent.
+If any signal IS present, set "notAnOrder": false.
+
+NEVER extract items from these regions of a screenshot (they are not part of the customer's order):
+  - "También te puede gustar" / "You may also like" / "Recommended for you" / "Más" recommendations
+  - "Pulse para ver los detalles del envío conjunto" sections (bundled-shipping promos)
+  - Sponsored/advertisement banners
 
 Extract the following information:
 1. Tracking number (if visible - may not be available yet if order just placed)
 2. Order number (order ID, confirmation number)
 3. Seller/Store name (Amazon, eBay seller name, etc.)
 4. Order date (when order was placed)
-5. Shipping carrier (USPS, UPS, FedEx, DHL, YunExpress, etc. - extract if visible)
+5. Shipping carrier (USPS, UPS, FedEx, DHL, YunExpress, GOFO, OnTrac, LaserShip, etc. - extract if visible. GOFO is a common LATAM freight forwarder appearing as an orange box logo with "GOFO" text in Shein orders.)
 6. List of ALL items with:
    - Product name (full name as shown)
    - Quantity ordered
@@ -171,7 +200,7 @@ Return data in this EXACT JSON format:
   "orderNumber": "order/confirmation number or null",
   "seller": "store/seller name or null",
   "orderDate": "YYYY-MM-DD format or null",
-  "shippingCarrier": "USPS|UPS|FedEx|DHL|YunExpress|other or null",
+  "shippingCarrier": "USPS|UPS|FedEx|DHL|YunExpress|GOFO|OnTrac|LaserShip|other or null",
   "items": [
     {
       "name": "full product name as shown on screenshot",
@@ -183,7 +212,8 @@ Return data in this EXACT JSON format:
       "category": "electronics|clothing|toys|food|accessories|other"
     }
   ],
-  "orderTotal": number (grand total in USD) or null
+  "orderTotal": number (grand total in USD) or null,
+  "notAnOrder": boolean (true if screenshot lacks order signals like shipping address, order status, order number, etc. — flag only, do NOT use this to skip extraction)
 }
 
 RULES:

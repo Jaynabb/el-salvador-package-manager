@@ -318,8 +318,12 @@ const buildCustomerBlocks = (orders: OrderRow[]): CustomerBlock[] => {
   });
 
   return sorted.map((order) => {
-    // Keep the original package number from the Machote
-    const pkgNum = (order.packageNumber || '').replace(/[^\d]/g, '') || '0';
+    // Keep the original package identifier from the Machote — could be a pure number
+    // ("5"), a warehouse code ("W12345"), or anything else Julio uses for control interno.
+    // Strip only the "Paquete #" prefix; preserve whatever identifier follows.
+    const pkgNum = (order.packageNumber || '')
+      .replace(/^Paquete\s*#?\s*/i, '')
+      .trim() || '0';
 
     if (!order.items || order.items.length === 0) {
       return {
@@ -350,9 +354,10 @@ const buildCustomerBlocks = (orders: OrderRow[]): CustomerBlock[] => {
       ? order.pieces
       : totalItemQuantity;
 
-    // Always use order.value (same as Machote) — this is the OCR/manual total
-    // and is the authoritative value. Don't recalculate from items.
-    const totalValue = order.value || 0;
+    // Per-customer total = sum of extracted line items. The Desarrollo grand total must
+    // equal the sum of every item across every screenshot — never trust an upstream
+    // OCR/manual total here. (order.value is kept for sanity-check / display only.)
+    const totalValue = itemsTotal;
 
     return {
       consignee: (order.consignee || '').trim().toUpperCase(),
@@ -530,13 +535,24 @@ interface PageData {
   merges: Record<string, unknown>[];
 }
 
+interface ExportProfile {
+  gestorNumber?: string;
+  displayName?: string;
+}
+
 const buildPageData = (
   page: CustomerBlock[],
   pageIndex: number,
   totalPages: number,
   sheetId: number,
   allSheetNames: string[],
+  profile?: ExportProfile,
+  grandTotalValue?: number,
 ): PageData => {
+  const gestorLabel = profile?.gestorNumber
+    ? `Gestor ${profile.gestorNumber}`
+    : 'Gestor';
+  const nombreLabel = profile?.displayName?.trim() || 'Nombre';
   const rows: Record<string, unknown>[] = [];
   const merges: Record<string, unknown>[] = [];
   const isLastPage = pageIndex === totalPages - 1;
@@ -550,7 +566,7 @@ const buildPageData = (
   // Row 1: registro + Gestor
   rows.push(makeRow({
     2: makeCell({ value: 'No. de registro de mercancías:' }),
-    9: makeCell({ value: 'Gestor 3145' }),
+    9: makeCell({ value: gestorLabel }),
   }));
   currentRow++;
 
@@ -700,10 +716,13 @@ const buildPageData = (
   // ── Grand TOTAL (last page, multi-page only) ─────────────────────────
 
   if (isLastPage && totalPages > 1) {
-    // Reference subtotal cell (J + SUBTOTAL_ROW_A1) on every sheet
-    const grandTotalFormula = allSheetNames
-      .map(name => `'${name}'!J${SUBTOTAL_ROW_A1}`)
-      .join('+');
+    // Multi-sheet grand TOTAL: written as a STATIC value (pre-summed at export time)
+    // rather than a cross-sheet formula like `='Hoja 1'!J64+'Hoja 2'!J64+...`. Reason:
+    // cross-sheet references are the part most likely to break when the customer
+    // downloads the Google Sheet as xlsx and opens it in Excel. Per-sheet subtotals
+    // and per-customer totals stay as formulas (single-sheet ranges always survive).
+    void allSheetNames;
+    void SUBTOTAL_ROW_A1;
 
     rows.push(makeRow({
       8: makeCell({
@@ -711,7 +730,8 @@ const buildPageData = (
         borders: { left: SOLID_BLACK, top: SOLID_BLACK, bottom: SOLID_BLACK },
       }),
       9: makeCell({
-        formula: `=${grandTotalFormula}`, bold: true,
+        value: grandTotalValue ?? 0,
+        bold: true,
         borders: { right: SOLID_BLACK, top: SOLID_BLACK, bottom: SOLID_BLACK },
         numberFormat: CURRENCY_FORMAT,
       }),
@@ -733,7 +753,7 @@ const buildPageData = (
   currentRow++;
 
   rows.push(makeRow({
-    2: makeCell({ value: 'Nombre' }),
+    2: makeCell({ value: nombreLabel }),
     8: makeCell({ value: 'Firma' }),
   }));
   currentRow++;
@@ -841,24 +861,60 @@ const createSpreadsheet = async (
 const shareFileWithLink = async (
   fileId: string,
   accessToken: string,
+  userEmail?: string,
 ): Promise<void> => {
-  try {
-    await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}/permissions`,
+  const postPermission = async (body: Record<string, unknown>): Promise<Response> => {
+    return fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}/permissions?supportsAllDrives=true&sendNotificationEmail=false`,
       {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          role: 'writer',
-          type: 'anyone',
-        }),
+        body: JSON.stringify(body),
       },
     );
-  } catch (err) {
-    console.warn('Failed to set sharing permissions:', err);
+  };
+
+  // 1. Explicit per-user share — the reliable path. Works even if the org's Drive policy
+  //    blocks anyone-with-link, AND it puts the Sheet in the user's "Shared with me" view.
+  let userShareOk = false;
+  if (userEmail) {
+    const resp = await postPermission({
+      role: 'writer',
+      type: 'user',
+      emailAddress: userEmail,
+    });
+    if (resp.ok) {
+      userShareOk = true;
+    } else {
+      const body = await resp.text().catch(() => '');
+      console.warn(`Per-user share to ${userEmail} failed (${resp.status}):`, body.slice(0, 300));
+    }
+  }
+
+  // 2. Anyone-with-link — nice-to-have for forwarding without inviting each recipient.
+  //    Try writer, fall back to reader if org policy blocks anyone-as-writer.
+  let anyoneShareOk = false;
+  const writerResp = await postPermission({ role: 'writer', type: 'anyone', allowFileDiscovery: false });
+  if (writerResp.ok) {
+    anyoneShareOk = true;
+  } else {
+    const readerResp = await postPermission({ role: 'reader', type: 'anyone', allowFileDiscovery: false });
+    if (readerResp.ok) {
+      anyoneShareOk = true;
+    } else {
+      const body = await readerResp.text().catch(() => '');
+      console.warn(`Anyone-with-link share failed (${readerResp.status}):`, body.slice(0, 300));
+    }
+  }
+
+  if (!userShareOk && !anyoneShareOk) {
+    throw new Error(
+      `Could not share the Sheet — neither per-user nor anyone-with-link permissions stuck. ` +
+      `Check that the connected Google account in Settings has Drive sharing enabled.`,
+    );
   }
 };
 
@@ -881,6 +937,8 @@ export const exportOrdersToGoogleSheet = async (
   orders: OrderRow[],
   organizationId: string,
   exportedBy?: string,
+  profile?: ExportProfile,
+  userEmail?: string,
 ): Promise<{ success: boolean; sheetUrl?: string; error?: string }> => {
   try {
     if (!orders || orders.length === 0) {
@@ -909,9 +967,12 @@ export const exportOrdersToGoogleSheet = async (
     const { spreadsheetId, spreadsheetUrl } = await createSpreadsheet(accessToken, title, sheetNames);
     console.log('✓ Spreadsheet created:', spreadsheetId);
 
-    // Build page data for each sheet
+    // Build page data for each sheet. Grand total is pre-computed from line items so
+    // it survives the Google Sheets → xlsx → Excel pipeline without relying on
+    // cross-sheet formula references.
+    const grandTotalValue = blocks.reduce((sum, b) => sum + b.totalValue, 0);
     const pageDataArray: PageData[] = pages.map((page, i) =>
-      buildPageData(page, i, pages.length, i, sheetNames),
+      buildPageData(page, i, pages.length, i, sheetNames, profile, grandTotalValue),
     );
 
     const requests = buildAllRequests(pageDataArray);
@@ -933,8 +994,9 @@ export const exportOrdersToGoogleSheet = async (
 
     console.log('✓ Spreadsheet formatted');
 
-    // Make accessible via link (so it works even in incognito/different accounts)
-    await shareFileWithLink(spreadsheetId, accessToken);
+    // Share — explicit per-user grant (most reliable, survives org Drive policies)
+    // PLUS anyone-with-link as a nice-to-have for forwarding.
+    await shareFileWithLink(spreadsheetId, accessToken, userEmail);
     console.log('✓ Sharing permissions set');
 
     // Move to Drive folder

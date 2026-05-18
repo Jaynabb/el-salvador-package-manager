@@ -5,6 +5,44 @@ import Tesseract from 'tesseract.js';
 const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY || '');
 
 /**
+ * Retry an async Gemini call with exponential backoff.
+ * Retries on rate-limit (429), server errors (5xx), timeouts, and network failures.
+ * Non-retryable errors (auth, invalid argument) propagate immediately.
+ *
+ * Why: client-side Gemini calls from end-user browsers (Julio in El Salvador) hit
+ * transient failures that bulk-uploads-from-headquarters never see. Without retry,
+ * each failed screenshot drops silently and the doc total varies between runs.
+ */
+export const withRetry = async <T>(
+  fn: () => Promise<T>,
+  opts: { label?: string; maxAttempts?: number } = {}
+): Promise<T> => {
+  const { label = 'Gemini call', maxAttempts = 3 } = opts;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = (err as any)?.message || String(err);
+      const status = (err as any)?.status || (err as any)?.statusCode;
+      const isRetryable =
+        status === 429 || status === 408 ||
+        (typeof status === 'number' && status >= 500 && status < 600) ||
+        /rate.?limit|quota|timeout|network|fetch|ECONNRESET|ETIMEDOUT|503|500|429|unavailable|deadline/i.test(msg);
+
+      if (!isRetryable || attempt === maxAttempts) {
+        throw err;
+      }
+      const delayMs = 1000 * Math.pow(2, attempt - 1);
+      console.warn(`⚠️ ${label} attempt ${attempt}/${maxAttempts} failed: ${msg.slice(0, 120)}. Retrying in ${delayMs}ms.`);
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+};
+
+/**
  * OCR fallback when Gemini vision blocks due to RECITATION
  * Extracts text from image, then sends to Gemini text model
  */

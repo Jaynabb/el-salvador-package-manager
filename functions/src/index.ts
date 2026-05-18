@@ -3,7 +3,7 @@
  * WhatsApp Integration - Complete Bridge to ImportFlow App
  */
 
-import {onRequest} from "firebase-functions/v2/https";
+import {onRequest, onCall, HttpsError} from "firebase-functions/v2/https";
 import {initializeApp} from "firebase-admin/app";
 import {getFirestore, Timestamp} from "firebase-admin/firestore";
 import {getStorage} from "firebase-admin/storage";
@@ -687,3 +687,110 @@ function getFileExtension(mimeType: string): string {
 
   return mimeToExt[mimeType.toLowerCase()] || "jpg";
 }
+
+/**
+ * Server-side retry helper for transient Gemini failures (429/5xx/network/timeout).
+ * Same logic as the client-side helper but runs in Cloud Functions, so every user
+ * gets the same retry behavior regardless of their network or device.
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  maxAttempts = 3
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = (err as Error)?.message || String(err);
+      const status = (err as {status?: number; statusCode?: number})?.status ||
+        (err as {status?: number; statusCode?: number})?.statusCode;
+      const isRetryable =
+        status === 429 || status === 408 ||
+        (typeof status === "number" && status >= 500 && status < 600) ||
+        /rate.?limit|quota|timeout|network|fetch|ECONNRESET|ETIMEDOUT|503|500|429|unavailable|deadline/i.test(msg);
+
+      if (!isRetryable || attempt === maxAttempts) throw err;
+      const delayMs = 1000 * Math.pow(2, attempt - 1);
+      console.warn(`⚠️ ${label} attempt ${attempt}/${maxAttempts} failed: ${msg.slice(0, 120)}. Retrying in ${delayMs}ms.`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Extract items from a batch of order screenshots.
+ *
+ * Why this exists: prior to this, every user's browser called Gemini directly with
+ * a client-side API key. Users on slower networks (Julio in El Salvador) hit
+ * transient failures, rate limits, and timeouts that headquarters users never
+ * see — same code, different runtime environment, different results.
+ *
+ * Moving extraction server-side gives every user identical execution: same Google
+ * Cloud region, same network, same retry policy, same API key + quota pool. The
+ * browser only uploads bytes; orchestration happens here.
+ *
+ * Client should chunk large docs into batches of ~10 images (~10MB payload max)
+ * and call this function sequentially.
+ */
+export const extractScreenshotBatch = onCall(
+  {
+    timeoutSeconds: 300,
+    memory: "1GiB",
+    maxInstances: 10,
+    cors: true,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Authentication required.");
+    }
+
+    const {images, lenient} = request.data as {
+      images?: Array<{base64: string; mimeType: string; clientIdx: number}>;
+      lenient?: boolean;
+    };
+
+    if (!Array.isArray(images) || images.length === 0) {
+      throw new HttpsError("invalid-argument", "images array is required.");
+    }
+    if (images.length > 15) {
+      throw new HttpsError("invalid-argument", "Batch size limited to 15 images per call. Chunk client-side.");
+    }
+    void lenient; // reserved for future use; server-side analyzer doesn't expose the flag yet
+
+    const CONCURRENCY = 3;
+    const results: Array<
+      | {clientIdx: number; ok: true; data: unknown}
+      | {clientIdx: number; ok: false; error: string}
+    > = [];
+
+    for (let i = 0; i < images.length; i += CONCURRENCY) {
+      const slice = images.slice(i, i + CONCURRENCY);
+      const settled = await Promise.all(
+        slice.map(async (img) => {
+          try {
+            const data = await withRetry(
+              () => analyzeOrderScreenshot(img.base64, img.mimeType),
+              `screenshot clientIdx=${img.clientIdx}`
+            );
+            return {clientIdx: img.clientIdx, ok: true as const, data};
+          } catch (err) {
+            const error = (err as Error)?.message || String(err);
+            console.error(`Screenshot clientIdx=${img.clientIdx} failed after retries:`, error);
+            return {clientIdx: img.clientIdx, ok: false as const, error: error.slice(0, 300)};
+          }
+        })
+      );
+      results.push(...settled);
+    }
+
+    return {results};
+  }
+);
+
+// Runtime Read API — read-only surface for the Edge AI Chatbot Runtime.
+// Scaffold; see handlers/runtimeReadApi.ts for the dispatch contract.
+export {runtimeReadApi} from "./handlers/runtimeReadApi";

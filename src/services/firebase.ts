@@ -5,6 +5,8 @@ import { getAuth } from 'firebase/auth';
 import type { Auth } from 'firebase/auth';
 import { getStorage } from 'firebase/storage';
 import type { FirebaseStorage } from 'firebase/storage';
+import { getFunctions } from 'firebase/functions';
+import type { Functions } from 'firebase/functions';
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -26,6 +28,7 @@ export const DEMO_MODE = !isFirebaseConfigured;
 let db: Firestore | null = null;
 let auth: Auth | null = null;
 let storage: FirebaseStorage | null = null;
+let functions: Functions | null = null;
 
 if (isFirebaseConfigured) {
   try {
@@ -33,6 +36,7 @@ if (isFirebaseConfigured) {
     db = getFirestore(app);
     auth = getAuth(app);
     storage = getStorage(app);
+    functions = getFunctions(app);
     console.log('✓ Firebase initialized successfully');
   } catch (error) {
     console.error('Firebase initialization error:', error);
@@ -43,4 +47,4 @@ if (isFirebaseConfigured) {
   console.warn('To use real Firebase, update your .env.local file with your Firebase credentials.');
 }
 
-export { db, auth, storage };
+export { db, auth, storage, functions };

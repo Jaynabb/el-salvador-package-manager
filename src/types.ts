@@ -70,6 +70,9 @@ export interface User {
   invitedBy?: string; // User ID who invited this user
   requirePasswordChange?: boolean; // True if user must change password on first login
   passwordChangedAt?: Date; // When password was last changed
+
+  // Customs profile (rendered into Desarrollo export — replaces hard-coded "Gestor 3145" / "nombre blanco")
+  gestorNumber?: string; // Operator's customs gestor ID, e.g. "3145"
 }
 
 // Organization Invite
