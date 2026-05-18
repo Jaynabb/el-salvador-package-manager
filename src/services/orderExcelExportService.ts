@@ -738,27 +738,28 @@ const buildPageData = (
     currentRow++;
   }
 
-  // ── Signature block (blank + name + underscores + labels) ────────────
+  // ── Signature block (blank + name-on-line + labels) ──────────────────
   //
   // Layout (both sides symmetric, Firma side blank for handwritten signature):
   //   row N:    (blank)            (blank)
-  //   row N+1:  Jamari McNabb      (blank)        ← printed name above Nombre line
-  //   row N+2:  __________         __________     ← signature lines
-  //   row N+3:  Nombre             Firma          ← labels
+  //   row N+1:  (blank)            (blank)
+  //   row N+2:  Jamari McNabb      (blank for signature)   ← name sits ON the line
+  //                ─────────          ─────────             ← cell's bottom border
+  //   row N+3:  Nombre             Firma                    ← labels
+  //
+  // The signature line is rendered as the cell's bottom border so the name visually
+  // touches it with no row-height gap. The Firma side is a blank cell with the same
+  // bottom border, leaving space for a handwritten signature directly on the line.
 
+  rows.push(emptyRow());
+  currentRow++;
   rows.push(emptyRow());
   currentRow++;
 
   const displayName = profile?.displayName?.trim() || '';
   rows.push(makeRow({
-    2: makeCell({ value: displayName }),
-    8: makeCell({ value: '' }),
-  }));
-  currentRow++;
-
-  rows.push(makeRow({
-    2: makeCell({ value: '____________________' }),
-    8: makeCell({ value: '____________________' }),
+    2: makeCell({ value: displayName, vAlign: 'BOTTOM', borders: { bottom: SOLID_BLACK } }),
+    8: makeCell({ value: '', borders: { bottom: SOLID_BLACK } }),
   }));
   currentRow++;
 
